@@ -1,13 +1,13 @@
 package com.changlinli.raptorqdemo
 
-import java.net.InetSocketAddress
+import java.net.{InetAddress, InetSocketAddress}
 import java.util.concurrent.{ExecutorService, Executors, TimeUnit}
 
 import cats.effect.{Blocker, ContextShift, ExitCode, IO, IOApp, Resource}
 import cats.implicits._
 import fs2.Chunk
 import fs2.io.udp.{Packet, Socket, SocketGroup}
-import net.fec.openrq.parameters.FECParameters
+import net.fec.openrq.parameters.{FECParameters, ParameterChecker}
 import net.fec.openrq.{EncodingPacket, OpenRQ}
 
 import scala.collection.immutable.ArraySeq
@@ -33,13 +33,14 @@ object ArraySeqUtils {
 
 object RaptorQEncoder {
   def encodeAsSingleBlock(data: ArraySeq[Byte]): (FECParameters, LazyList[EncodingPacket]) = {
-    val fecParameters = FECParameters.newParameters(data.length, 10, 1)
+    val symbolSize = 10
+    val fecParameters = FECParameters.newParameters(data.length, symbolSize, 1)
     val encoder = OpenRQ.newEncoder(
       ArraySeqUtils.unsafeToByteArray(data),
       fecParameters
     ).sourceBlock(0)
-    val numberOfSourceSymbols = data.length / 1000 + 1
-    val maximumNumberOfRepairPackets = 10000
+    val numberOfSourceSymbols = data.length / symbolSize + 1
+    val maximumNumberOfRepairPackets = 1 + ParameterChecker.maxEncodingSymbolID() - numberOfSourceSymbols
     val packets = LazyList
       .from(encoder.sourcePacketsIterable().asScala)
       .appendedAll(encoder.repairPacketsIterable(maximumNumberOfRepairPackets).asScala)
@@ -55,8 +56,9 @@ object RaptorQEncoder {
     val sourceBlockEncoders = topLevelEncoder.sourceBlockIterable().asScala.toList
     val sourceBlockToEncoder = sourceBlockEncoders
       .map{encoder =>
+        val maximumNumberOfRepairPackets = ParameterChecker.numRepairSymbolsPerBlock(encoder.numberOfSourceSymbols())
         val repairPackets = encoder
-          .repairPacketsIterable(10000)
+          .repairPacketsIterable(maximumNumberOfRepairPackets)
           .asScala
           .|>(x =>  LazyList.from(x))
         val sourcePackets = encoder
@@ -147,10 +149,45 @@ object GlobalResources {
 
   val blockerResource: Resource[IO, Blocker] = blockerAndExecutorResource.map(_._1)
 
-  def socketResource(port: Int): Resource[IO, Socket[IO]] = blockerResource
+  def socketResourceByIpAddress(ipAddress: String, port: Int): Resource[IO, Socket[IO]] = blockerResource
+    .flatMap(blocker => SocketGroup[IO](blocker))
+    .flatMap(socketGroup => socketGroup.open(new InetSocketAddress(InetAddress.getByName(ipAddress), port)))
+
+  def socketResourceLocalhost(port: Int): Resource[IO, Socket[IO]] = blockerResource
     .flatMap(blocker => SocketGroup[IO](blocker))
     .flatMap(socketGroup => socketGroup.open(new InetSocketAddress(port)))
 
+}
+
+object UdpClient {
+  implicit val contextShift = GlobalResources.contextShift
+
+  val myBytes = ArraySeq.from(Range(1, 100).map(int => int.toByte))
+
+  val (fecParameters1, udpPackets) = UdpProcessing.sendAsUdp(myBytes)
+
+  val run: IO[Unit] = {
+    GlobalResources
+      .socketResourceLocalhost(8011)
+      .use{
+        (socket: Socket[IO]) =>
+          val writeOutDummyPacket = socket
+            .write(Packet(new InetSocketAddress(InetAddress.getByName("178.62.26.117"), 8012), Chunk.bytes(Array[Byte](1, 2, 3))))
+            .*>(IO(println("Sent a dummy packet!")))
+          val receivePackets = socket
+            .reads()
+            .take(100)
+            .concurrently(fs2.Stream.eval(writeOutDummyPacket))
+            .evalTap(packet => IO(println(s"Packet: $packet")))
+            .map(UdpProcessing.fromUdpPacket(fecParameters1, _))
+            .compile
+            .toList
+            .map(encodingPackets => BatchRaptorQDecoder.batchDecode(encodingPackets, fecParameters1))
+            .flatMap(bytes => IO(println(s"Our bytes were: $bytes")))
+//          writeOutDummyPacket.*>(receivePackets)
+          receivePackets
+      }
+  }
 }
 
 object UdpServer {
@@ -163,8 +200,9 @@ object UdpServer {
 
   val (fecParameters1, udpPackets) = UdpProcessing.sendAsUdp(myBytes)
 
-  def writeOutPackets(socket: Socket[IO]): IO[Unit] = {
+  def writeOutPackets(socket: Socket[IO], address: InetSocketAddress): IO[Unit] = {
     udpPackets
+      .map(packet => packet.copy(remote = address))
       .take(1000)
       .flatMap{
         packet =>
@@ -176,17 +214,24 @@ object UdpServer {
           }
       }
       .toList
-      .traverse_(udpPacket => socket.write(udpPacket, Some(FiniteDuration(1, TimeUnit.SECONDS))))
+      .traverse_(udpPacket => IO(println(s"Writing out this UDP packet: $udpPacket"))*>(socket.write(udpPacket, Some(FiniteDuration(1, TimeUnit.SECONDS)))))
+  }
+
+  def respondToIncomingPacket(udpPacket: Packet, socket: Socket[IO]): IO[Unit] = {
+    for {
+      _ <- IO(println(s"Received a packet: $udpPacket"))
+      _ <- writeOutPackets(socket, udpPacket.remote)
+    } yield ()
   }
 
   val run: IO[Unit] = {
-    GlobalResources.socketResource(8012)
-      .flatMap(readSocket => GlobalResources.socketResource(8013).map((readSocket, _)))
+    GlobalResources.socketResourceLocalhost(8012)
+      .flatMap(readSocket => GlobalResources.socketResourceLocalhost(8013).map((readSocket, _)))
       .use{
         case (readSocket: Socket[IO], writeSocket: Socket[IO]) =>
           readSocket
             .reads()
-            .evalTap(packet => IO(println(s"Received a packet: $packet"))*>(writeOutPackets(writeSocket)))
+            .evalTap(packet => IO(println(s"Received a packet: $packet"))*>(respondToIncomingPacket(packet, readSocket)))
             .compile
             .drain
       }
@@ -202,39 +247,8 @@ object Main extends IOApp {
     val result = BatchRaptorQDecoder.batchDecode(loseALotOfEncodedBytes.take(1000).toList, fecParameters)
     println(s"Hello world!: $result")
 
-    val blockerAndExecutorResource: Resource[IO, (Blocker, ExecutorService)] =
-      Resource.make{
-        IO{
-          val threadPool = Executors.newCachedThreadPool()
-          val blocker = Blocker.liftExecutionContext(ExecutionContext.fromExecutorService(threadPool))
-          (blocker, threadPool)
-        }
-      }{case (_, executorService) => IO(executorService.shutdown())}
-
-    val blockerResource: Resource[IO, Blocker] = blockerAndExecutorResource.map(_._1)
-
-    val (fecParameters1, udpPackets) = UdpProcessing.sendAsUdp(myBytes)
-
-    val action = if (args(1) == "r") {
-      blockerResource
-        .flatMap(blocker => SocketGroup[IO](blocker))
-        .flatMap(socketGroup => socketGroup.open(new InetSocketAddress(8011)))
-        .use{
-          (socket: Socket[IO]) =>
-            val writeOutDummyPacket = socket
-              .write(Packet(new InetSocketAddress(8012), Chunk.bytes(Array[Byte](1, 2, 3))))
-              .*>(IO(println("Sent a dummy packet!")))
-            val receivePackets = socket
-              .reads()
-              .take(100)
-              .evalTap(packet => IO(println(s"Packet: $packet")))
-              .map(UdpProcessing.fromUdpPacket(fecParameters1, _))
-              .compile
-              .toList
-              .map(encodingPackets => BatchRaptorQDecoder.batchDecode(encodingPackets, fecParameters1))
-              .flatMap(bytes => IO(println(s"Our bytes were: $bytes")))
-            writeOutDummyPacket.*>(receivePackets)
-        }
+    val action = if (args(1) == "client") {
+      UdpClient.run
     } else {
       println(s"Our arg was ${args(1)}")
       UdpServer.run
