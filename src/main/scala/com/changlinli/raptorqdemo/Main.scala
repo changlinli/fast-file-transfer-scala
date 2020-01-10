@@ -3,7 +3,7 @@ package com.changlinli.raptorqdemo
 import java.net.InetSocketAddress
 import java.util.concurrent.{ExecutorService, Executors, TimeUnit}
 
-import cats.effect.{Blocker, ExitCode, IO, IOApp, Resource}
+import cats.effect.{Blocker, ContextShift, ExitCode, IO, IOApp, Resource}
 import cats.implicits._
 import fs2.Chunk
 import fs2.io.udp.{Packet, Socket, SocketGroup}
@@ -133,10 +133,63 @@ object UdpProcessing {
   }
 }
 
+object GlobalResources {
+  implicit val contextShift: ContextShift[IO] = IO.contextShift(scala.concurrent.ExecutionContext.global)
+
+  val blockerAndExecutorResource: Resource[IO, (Blocker, ExecutorService)] =
+    Resource.make{
+      IO{
+        val threadPool = Executors.newCachedThreadPool()
+        val blocker = Blocker.liftExecutionContext(ExecutionContext.fromExecutorService(threadPool))
+        (blocker, threadPool)
+      }
+    }{case (_, executorService) => IO(executorService.shutdown())}
+
+  val blockerResource: Resource[IO, Blocker] = blockerAndExecutorResource.map(_._1)
+
+  def socketResource(port: Int): Resource[IO, Socket[IO]] = blockerResource
+    .flatMap(blocker => SocketGroup[IO](blocker))
+    .flatMap(socketGroup => socketGroup.open(new InetSocketAddress(port)))
+
+}
+
 object UdpServer {
 
   def listenToSocket(socket: Socket[IO]) = {
     socket.reads()
+  }
+
+  val myBytes = ArraySeq.from(Range(1, 100).map(int => int.toByte))
+
+  val (fecParameters1, udpPackets) = UdpProcessing.sendAsUdp(myBytes)
+
+  def writeOutPackets(socket: Socket[IO]): IO[Unit] = {
+    udpPackets
+      .take(1000)
+      .flatMap{
+        packet =>
+          val firstByte: Byte = packet.bytes.last.getOrElse(0)
+          if (firstByte % 3 == 0) {
+            LazyList(packet)
+          } else {
+            LazyList.empty
+          }
+      }
+      .toList
+      .traverse_(udpPacket => socket.write(udpPacket, Some(FiniteDuration(1, TimeUnit.SECONDS))))
+  }
+
+  val run: IO[Unit] = {
+    GlobalResources.socketResource(8012)
+      .flatMap(readSocket => GlobalResources.socketResource(8013).map((readSocket, _)))
+      .use{
+        case (readSocket: Socket[IO], writeSocket: Socket[IO]) =>
+          readSocket
+            .reads()
+            .evalTap(packet => IO(println(s"Received a packet: $packet"))*>(writeOutPackets(writeSocket)))
+            .compile
+            .drain
+      }
   }
 }
 
@@ -167,8 +220,11 @@ object Main extends IOApp {
         .flatMap(blocker => SocketGroup[IO](blocker))
         .flatMap(socketGroup => socketGroup.open(new InetSocketAddress(8011)))
         .use{
-          socket =>
-            socket
+          (socket: Socket[IO]) =>
+            val writeOutDummyPacket = socket
+              .write(Packet(new InetSocketAddress(8012), Chunk.bytes(Array[Byte](1, 2, 3))))
+              .*>(IO(println("Sent a dummy packet!")))
+            val receivePackets = socket
               .reads()
               .take(100)
               .evalTap(packet => IO(println(s"Packet: $packet")))
@@ -177,28 +233,11 @@ object Main extends IOApp {
               .toList
               .map(encodingPackets => BatchRaptorQDecoder.batchDecode(encodingPackets, fecParameters1))
               .flatMap(bytes => IO(println(s"Our bytes were: $bytes")))
+            writeOutDummyPacket.*>(receivePackets)
         }
     } else {
       println(s"Our arg was ${args(1)}")
-      blockerResource
-        .flatMap(blocker => SocketGroup[IO](blocker))
-        .flatMap(socketGroup => socketGroup.open(new InetSocketAddress(8012)))
-        .use{
-          (socket: Socket[IO]) =>
-            udpPackets
-              .take(1000)
-              .flatMap{
-                packet =>
-                  val firstByte: Byte = packet.bytes.last.getOrElse(0)
-                  if (firstByte % 3 == 0) {
-                    LazyList(packet)
-                  } else {
-                    LazyList.empty
-                  }
-              }
-              .toList
-              .traverse(udpPacket => socket.write(udpPacket, Some(FiniteDuration(1, TimeUnit.SECONDS))))
-        }
+      UdpServer.run
     }
     for {
       _ <- action
