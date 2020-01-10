@@ -1,16 +1,14 @@
 package com.changlinli.raptorqdemo
 
 import java.net.InetSocketAddress
-import java.nio.ByteBuffer
 import java.util.concurrent.{ExecutorService, Executors, TimeUnit}
 
-import cats.implicits._
 import cats.effect.{Blocker, ExitCode, IO, IOApp, Resource}
+import cats.implicits._
 import fs2.Chunk
 import fs2.io.udp.{Packet, Socket, SocketGroup}
+import net.fec.openrq.parameters.FECParameters
 import net.fec.openrq.{EncodingPacket, OpenRQ}
-import net.fec.openrq.parameters.{FECParameters, ParameterChecker}
-import net.fec.openrq.util.io.ByteBuffers
 
 import scala.collection.immutable.ArraySeq
 import scala.collection.immutable.ArraySeq.ofByte
@@ -99,6 +97,7 @@ object BatchRaptorQDecoder {
     if (topLevelDecoder.isDataDecoded) {
       ArraySeq.unsafeWrapArray(topLevelDecoder.dataArray())
     } else {
+      // FIXME
       throw new Exception("waejriaowejroiaweor")
     }
   }
