@@ -170,7 +170,7 @@ object Main extends IOApp {
         .use{
           socket =>
             socket
-              .reads(Some(FiniteDuration(10, TimeUnit.SECONDS)))
+              .reads()
               .take(100)
               .evalTap(packet => IO(println(s"Packet: $packet")))
               .map(UdpProcessing.fromUdpPacket(fecParameters1, _))
@@ -188,6 +188,15 @@ object Main extends IOApp {
           (socket: Socket[IO]) =>
             udpPackets
               .take(1000)
+              .flatMap{
+                packet =>
+                  val firstByte: Byte = packet.bytes.last.getOrElse(0)
+                  if (firstByte % 3 == 0) {
+                    LazyList(packet)
+                  } else {
+                    LazyList.empty
+                  }
+              }
               .toList
               .traverse(udpPacket => socket.write(udpPacket, Some(FiniteDuration(1, TimeUnit.SECONDS))))
         }
