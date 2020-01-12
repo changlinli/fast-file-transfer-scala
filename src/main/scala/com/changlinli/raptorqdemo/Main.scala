@@ -1,20 +1,29 @@
 package com.changlinli.raptorqdemo
 
+import java.{lang, util}
 import java.net.{InetAddress, InetSocketAddress}
+import java.nio.file.{Files, Paths}
 import java.util.concurrent.{ExecutorService, Executors, TimeUnit}
 
-import cats.effect.{Blocker, ContextShift, ExitCode, IO, IOApp, Resource}
+import cats.Monad
+import cats.effect.{Blocker, Concurrent, ContextShift, ExitCode, IO, IOApp, Resource, Sync}
 import cats.implicits._
 import fs2.Chunk
 import fs2.io.udp.{Packet, Socket, SocketGroup}
+import net.fec.openrq.decoder.DataDecoder
 import net.fec.openrq.parameters.{FECParameters, ParameterChecker}
 import net.fec.openrq.{EncodingPacket, OpenRQ}
 
 import scala.collection.immutable.ArraySeq
 import scala.collection.immutable.ArraySeq.ofByte
+import scala.collection.mutable
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.FiniteDuration
+import scala.io.Source
 import scala.jdk.CollectionConverters._
+import scala.collection.parallel.CollectionConverters._
+import scala.collection.parallel.{ForkJoinTaskSupport, ParIterable, ParSeq}
+import scala.language.higherKinds
 
 sealed trait BatchDecodeErrors
 final case class ProbabilisticDecodeFailure() extends BatchDecodeErrors
@@ -29,22 +38,24 @@ object ArraySeqUtils {
       backedByOtherArray.copyToArray(resultArray)
       resultArray
   }
+
+  def readFromFile(fileName: String): IO[ArraySeq[Byte]] = IO{
+    ArraySeq.unsafeWrapArray(Files.readAllBytes(Paths.get(fileName)))
+  }
+
+  def writeToFile(fileName: String, bytes: Array[Byte]): IO[Unit] = IO {
+    Files.write(Paths.get(fileName), bytes)
+  }
+
+  def writeToFile(fileName: String, bytes: ArraySeq[Byte]): IO[Unit] = IO {
+    Files.write(Paths.get(fileName), unsafeToByteArray(bytes))
+  }
 }
 
 object RaptorQEncoder {
   def encodeAsSingleBlock(data: ArraySeq[Byte]): (FECParameters, LazyList[EncodingPacket]) = {
-    val symbolSize = 10
-    val fecParameters = FECParameters.newParameters(data.length, symbolSize, 1)
-    val encoder = OpenRQ.newEncoder(
-      ArraySeqUtils.unsafeToByteArray(data),
-      fecParameters
-    ).sourceBlock(0)
-    val numberOfSourceSymbols = data.length / symbolSize + 1
-    val maximumNumberOfRepairPackets = 1 + ParameterChecker.maxEncodingSymbolID() - numberOfSourceSymbols
-    val packets = LazyList
-      .from(encoder.sourcePacketsIterable().asScala)
-      .appendedAll(encoder.repairPacketsIterable(maximumNumberOfRepairPackets).asScala)
-    (fecParameters, packets)
+    val result = encode(data, 10, 1)
+    result.copy(_2 = LazyList.from(result._2))
   }
 
   def encode(data: ArraySeq[Byte], symbolSize: Int, numberOfSourceBlocks: Int): (FECParameters, LazyList[EncodingPacket]) = {
@@ -82,25 +93,98 @@ object RaptorQEncoder {
     }
     (fecParameters, allPackets.flatten)
   }
+
+  def encodeAsSingleBlockA(data: ArraySeq[Byte], symbolSize: Int): (FECParameters, Iterator[EncodingPacket]) = {
+    val fecParameters = FECParameters.newParameters(data.length, symbolSize, 1)
+    val topLevelEncoder = OpenRQ.newEncoder(
+      ArraySeqUtils.unsafeToByteArray(data),
+      fecParameters
+    )
+    val sourceEncoder = topLevelEncoder.sourceBlock(0)
+    val maximumNumberOfRepairPackets = ParameterChecker.numRepairSymbolsPerBlock(sourceEncoder.numberOfSourceSymbols())
+    val sourcePackets = topLevelEncoder.sourceBlock(0).sourcePacketsIterable()
+    val repairPackets = topLevelEncoder.sourceBlock(0).repairPacketsIterable(maximumNumberOfRepairPackets)
+    val sourcePacketIterator = sourcePackets.iterator()
+    val repairPacketIterator = repairPackets.iterator()
+    val iterator = new Iterator[EncodingPacket] {
+      override def hasNext: Boolean =
+        sourcePacketIterator.hasNext || repairPacketIterator.hasNext
+
+      override def next(): EncodingPacket = {
+        val result = if (sourcePackets.iterator().hasNext) {
+          sourcePacketIterator.next()
+        } else {
+          repairPacketIterator.next()
+        }
+        result
+      }
+    }
+    (fecParameters, iterator)
+  }
+
+
+  private def takeFromJavaIterable[A](n: Int, javaIterable: java.lang.Iterable[A]): mutable.Buffer[A] = {
+    var numberLeft = n
+    val buffer = mutable.Buffer.empty[A]
+    while (javaIterable.iterator().hasNext && numberLeft > 0) {
+      buffer.append(javaIterable.iterator().next())
+      numberLeft = numberLeft - 1
+    }
+    buffer
+  }
+
+  def encodeUnordered[F[_] : Concurrent](data: ArraySeq[Byte], symbolSize: Int, numberOfSourceBlocks: Int): (FECParameters, fs2.Stream[F, EncodingPacket]) = {
+    val fecParameters = FECParameters.newParameters(data.length, symbolSize, numberOfSourceBlocks)
+    val topLevelEncoder = OpenRQ.newEncoder(
+      ArraySeqUtils.unsafeToByteArray(data),
+      fecParameters
+    )
+    val sourceBlockEncoders = topLevelEncoder.sourceBlockIterable().asScala.toList
+    val allIterators = sourceBlockEncoders.map{
+      encoder =>
+        val maximumNumberOfRepairPackets = ParameterChecker.numRepairSymbolsPerBlock(encoder.numberOfSourceSymbols())
+        val repairPackets = encoder
+          .repairPacketsIterable(maximumNumberOfRepairPackets)
+        val sourcePackets = encoder
+          .sourcePacketsIterable()
+        val sourceStream = fs2.Stream.fromIterator[F](sourcePackets.asScala.iterator).chunkN(100)
+        val repairStream = fs2.Stream.fromIterator[F](repairPackets.asScala.iterator).chunkN(100)
+        sourceStream ++ repairStream
+    }
+
+    val stream = fs2.Stream
+      .fromIterator[F](allIterators.iterator)
+      .parJoinUnbounded
+      .flatMap(chunk => fs2.Stream.fromIterator[F](chunk.iterator))
+
+    (fecParameters, stream)
+  }
+
 }
 
 object BatchRaptorQDecoder {
   def batchDecode(allPackets: List[EncodingPacket], fecParameters: FECParameters): ArraySeq[Byte] = {
-    val numberOfSourceBlocks = fecParameters.numberOfSourceBlocks
     val topLevelDecoder = OpenRQ.newDecoder(fecParameters, 5)
-    val decoders = Range(0, numberOfSourceBlocks)
-      .map {
-        sourceBlock =>
-          val decoder = topLevelDecoder.sourceBlock(sourceBlock)
-          sourceBlock -> decoder
-      }
-      .toMap
-    allPackets.foreach(packet => decoders.get(packet.sourceBlockNumber()).map(decoder => decoder.putEncodingPacket(packet)))
+    allPackets.foreach{
+      packet =>
+        topLevelDecoder.sourceBlock(packet.sourceBlockNumber()).putEncodingPacket(packet)
+    }
     if (topLevelDecoder.isDataDecoded) {
       ArraySeq.unsafeWrapArray(topLevelDecoder.dataArray())
     } else {
       // FIXME
       throw new Exception("waejriaowejroiaweor")
+    }
+  }
+
+  def feedSinglePacket(packet: EncodingPacket, fecParameters: FECParameters, decoder: DataDecoder): Unit = {
+    decoder.sourceBlock(packet.sourceBlockNumber()).putEncodingPacket(packet)
+  }
+
+  def feedPackets(allPackets: Iterable[EncodingPacket], fecParameters: FECParameters, decoder: DataDecoder): Unit = {
+    allPackets.foreach{
+      packet =>
+        decoder.sourceBlock(packet.sourceBlockNumber()).putEncodingPacket(packet)
     }
   }
 }
@@ -138,52 +222,50 @@ object UdpProcessing {
 object GlobalResources {
   implicit val contextShift: ContextShift[IO] = IO.contextShift(scala.concurrent.ExecutionContext.global)
 
-  val blockerAndExecutorResource: Resource[IO, (Blocker, ExecutorService)] =
+  def blockerAndExecutorResource[F[_] : Sync]: Resource[F, (Blocker, ExecutorService)] =
     Resource.make{
-      IO{
+      Sync[F].delay{
         val threadPool = Executors.newCachedThreadPool()
         val blocker = Blocker.liftExecutionContext(ExecutionContext.fromExecutorService(threadPool))
         (blocker, threadPool)
       }
-    }{case (_, executorService) => IO(executorService.shutdown())}
+    }{case (_, executorService) => Sync[F].delay(executorService.shutdown())}
 
-  val blockerResource: Resource[IO, Blocker] = blockerAndExecutorResource.map(_._1)
+  def blockerResource[F[_] : Sync]: Resource[F, Blocker] = blockerAndExecutorResource[F].map(_._1)
 
-  def socketResourceByIpAddress(ipAddress: String, port: Int): Resource[IO, Socket[IO]] = blockerResource
-    .flatMap(blocker => SocketGroup[IO](blocker))
-    .flatMap(socketGroup => socketGroup.open(new InetSocketAddress(InetAddress.getByName(ipAddress), port)))
+  def socketResourceByIpAddress[F[_] : Concurrent : ContextShift](ipAddress: String, port: Int): Resource[F, Socket[F]] = blockerResource
+    .flatMap(blocker => SocketGroup[F](blocker))
+    .flatMap(socketGroup => socketGroup.open[F](new InetSocketAddress(InetAddress.getByName(ipAddress), port)))
 
-  def socketResourceLocalhost(port: Int): Resource[IO, Socket[IO]] = blockerResource
-    .flatMap(blocker => SocketGroup[IO](blocker))
-    .flatMap(socketGroup => socketGroup.open(new InetSocketAddress(port)))
+  def socketResourceLocalhost[F[_] : Concurrent : ContextShift](port: Int): Resource[F, Socket[F]] = blockerResource
+    .flatMap(blocker => SocketGroup[F](blocker))
+    .flatMap(socketGroup => socketGroup.open[F](new InetSocketAddress(port)))
 
 }
 
 object UdpClient {
-  implicit val contextShift = GlobalResources.contextShift
-
   val myBytes = ArraySeq.from(Range(1, 100).map(int => int.toByte))
 
   val (fecParameters1, udpPackets) = UdpProcessing.sendAsUdp(myBytes)
 
-  val run: IO[Unit] = {
+  def run[F[_] : Concurrent : ContextShift]: F[Unit] = {
     GlobalResources
-      .socketResourceLocalhost(8011)
+      .socketResourceLocalhost[F](8011)
       .use{
-        (socket: Socket[IO]) =>
+        (socket: Socket[F]) =>
           val writeOutDummyPacket = socket
             .write(Packet(new InetSocketAddress(InetAddress.getByName("178.62.26.117"), 8012), Chunk.bytes(Array[Byte](1, 2, 3))))
-            .*>(IO(println("Sent a dummy packet!")))
+            .*>(Sync[F].delay(println("Sent a dummy packet!")))
           val receivePackets = socket
             .reads()
             .take(100)
             .concurrently(fs2.Stream.eval(writeOutDummyPacket))
-            .evalTap(packet => IO(println(s"Packet: $packet")))
+            .evalTap(packet => Sync[F].delay(println(s"Packet: $packet")))
             .map(UdpProcessing.fromUdpPacket(fecParameters1, _))
             .compile
             .toList
             .map(encodingPackets => BatchRaptorQDecoder.batchDecode(encodingPackets, fecParameters1))
-            .flatMap(bytes => IO(println(s"Our bytes were: $bytes")))
+            .flatMap(bytes => Sync[F].delay(println(s"Our bytes were: $bytes")))
 //          writeOutDummyPacket.*>(receivePackets)
           receivePackets
       }
@@ -192,15 +274,11 @@ object UdpClient {
 
 object UdpServer {
 
-  def listenToSocket(socket: Socket[IO]) = {
-    socket.reads()
-  }
-
   val myBytes = ArraySeq.from(Range(1, 100).map(int => int.toByte))
 
   val (fecParameters1, udpPackets) = UdpProcessing.sendAsUdp(myBytes)
 
-  def writeOutPackets(socket: Socket[IO], address: InetSocketAddress): IO[Unit] = {
+  def writeOutPackets[F[_] : Sync](socket: Socket[F], address: InetSocketAddress): F[Unit] = {
     udpPackets
       .map(packet => packet.copy(remote = address))
       .take(1000)
@@ -214,24 +292,24 @@ object UdpServer {
           }
       }
       .toList
-      .traverse_(udpPacket => IO(println(s"Writing out this UDP packet: $udpPacket"))*>(socket.write(udpPacket, Some(FiniteDuration(1, TimeUnit.SECONDS)))))
+      .traverse_(udpPacket => Sync[F].delay(println(s"Writing out this UDP packet: $udpPacket"))*>(socket.write(udpPacket, Some(FiniteDuration(1, TimeUnit.SECONDS)))))
   }
 
-  def respondToIncomingPacket(udpPacket: Packet, socket: Socket[IO]): IO[Unit] = {
+  def respondToIncomingPacket[F[_] : Sync](udpPacket: Packet, socket: Socket[F]): F[Unit] = {
     for {
-      _ <- IO(println(s"Received a packet: $udpPacket"))
-      _ <- writeOutPackets(socket, udpPacket.remote)
+      _ <- Sync[F].delay(println(s"Received a packet: $udpPacket"))
+      _ <- writeOutPackets[F](socket, udpPacket.remote)
     } yield ()
   }
 
-  val run: IO[Unit] = {
-    GlobalResources.socketResourceLocalhost(8012)
-      .flatMap(readSocket => GlobalResources.socketResourceLocalhost(8013).map((readSocket, _)))
+  def run[F[_] : Concurrent: ContextShift]: F[Unit] = {
+    GlobalResources.socketResourceLocalhost[F](8012)
+      .flatMap(readSocket => GlobalResources.socketResourceLocalhost[F](8013).map((readSocket, _)))
       .use{
-        case (readSocket: Socket[IO], writeSocket: Socket[IO]) =>
+        case (readSocket: Socket[F], writeSocket: Socket[F]) =>
           readSocket
             .reads()
-            .evalTap(packet => IO(println(s"Received a packet: $packet"))*>(respondToIncomingPacket(packet, readSocket)))
+            .evalTap(packet => Sync[F].delay(println(s"Received a packet: $packet"))*>(respondToIncomingPacket(packet, readSocket)))
             .compile
             .drain
       }
@@ -248,10 +326,18 @@ object Main extends IOApp {
     println(s"Hello world!: $result")
 
     val action = if (args(1) == "client") {
-      UdpClient.run
+      UdpClient.run[IO]
+    } else if (args(1) == "server") {
+      UdpServer.run[IO]
     } else {
-      println(s"Our arg was ${args(1)}")
-      UdpServer.run
+      IO{
+        Thread.sleep(20000)
+        val myBytes = ArraySeqUtils.readFromFile("Track 10.wav").unsafeRunSync()
+        val (fecParameters, encodedBytes) = RaptorQEncoder.encodeUnordered[IO](myBytes, 10000, 20)
+        val loseALotOfEncodedBytes = encodedBytes.dropWhile(packet => packet.encodingSymbolID() % 2 == 0).take(100000)
+        val loseALotOfEncodedBytesForced = loseALotOfEncodedBytes.take(myBytes.length + 200).compile.drain.unsafeRunSync()
+        println("BEGINNING DECODE!")
+      }
     }
     for {
       _ <- action
