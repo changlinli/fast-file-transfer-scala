@@ -32,18 +32,27 @@ class TestRaptorCode extends AnyFlatSpec with Matchers {
 //    val loseALotOfEncodedBytesForced = loseALotOfEncodedBytes.take(myBytes.length + 200).compile.drain.unsafeRunSync()
 //    encodedBytes.take(100000).force
     println("BEGINNING ENCODE!")
-    val (fecParameters, iterator) = RaptorQEncoder.encodeAsSingleBlockA(myBytes, 10000)
+    val (fecParameters, iterator) = RaptorQEncoder.encodeAsSingleBlockIterator(myBytes, 10000)
     println("BEGINNING DECODE!")
     val beginningTime = System.currentTimeMillis()
     val topLevelDecoder = OpenRQ.newDecoder(fecParameters, 5)
     iterator.takeWhile{
       packet =>
-        BatchRaptorQDecoder.feedSinglePacket(packet, fecParameters, topLevelDecoder)
-        !topLevelDecoder.isDataDecoded
+        !BatchRaptorQDecoder.feedSinglePacket(packet, fecParameters, topLevelDecoder)
     }.foreach(_ => ())
     println(s"WE FINISHED: ${topLevelDecoder.isDataDecoded}, ms: ${System.currentTimeMillis() - beginningTime}")
-    println(s"Size of decoded data is ${topLevelDecoder.dataArray().size}")
-    ArraySeqUtils.writeToFile("output.wav", topLevelDecoder.dataArray()).unsafeRunSync()
+    println(s"Size of decoded data is ${topLevelDecoder.dataArray().length}")
+    val (fecParameters0, stream) = RaptorQEncoder.encodeAsSingleBlockStream[IO](myBytes, 10000)
+    val topLevelDecoder0 = OpenRQ.newDecoder(fecParameters0, 5)
+    val beginningTimeIO = System.currentTimeMillis()
+    stream
+      .evalMap(BatchRaptorQDecoder.feedSinglePacketSync[IO](_, fecParameters0, topLevelDecoder0))
+      .takeWhile(isDecoded => !isDecoded)
+      .compile
+      .drain
+      .unsafeRunSync()
+    println(s"WE FINISHED IO: ms: ${System.currentTimeMillis() - beginningTimeIO}")
+    ArraySeqUtils.writeToFile[IO]("output.wav", topLevelDecoder.dataArray()).unsafeRunSync()
 //    iterator.take(1000000).foreach(packet => BatchRaptorQDecoder.feedSinglePacket(packet, fecParameters, topLevelDecoder))
 //    println(s"Is this decoded: ${topLevelDecoder.isDataDecoded}")
 //    loseALotOfEncodedBytesForced should be ()

@@ -1,8 +1,13 @@
 package com.changlinli.raptorqdemo
 
+import java.io.DataOutput
 import java.{lang, util}
 import java.net.{InetAddress, InetSocketAddress}
-import java.nio.file.{Files, Paths}
+import java.nio.ByteBuffer
+import java.nio.channels.WritableByteChannel
+import java.nio.file.{Files, Path, Paths}
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{ExecutorService, Executors, TimeUnit}
 
 import cats.Monad
@@ -12,7 +17,7 @@ import fs2.Chunk
 import fs2.io.udp.{Packet, Socket, SocketGroup}
 import net.fec.openrq.decoder.DataDecoder
 import net.fec.openrq.parameters.{FECParameters, ParameterChecker}
-import net.fec.openrq.{EncodingPacket, OpenRQ}
+import net.fec.openrq.{EncodingPacket, OpenRQ, SerializablePacket, SymbolType}
 
 import scala.collection.immutable.ArraySeq
 import scala.collection.immutable.ArraySeq.ofByte
@@ -43,7 +48,11 @@ object ArraySeqUtils {
     ArraySeq.unsafeWrapArray(Files.readAllBytes(Paths.get(fileName)))
   }
 
-  def writeToFile(fileName: String, bytes: Array[Byte]): IO[Unit] = IO {
+  def readFromPath[F[_] : Sync](path: Path): F[ArraySeq[Byte]] = Sync[F].delay{
+    ArraySeq.unsafeWrapArray(Files.readAllBytes(path))
+  }
+
+  def writeToFile[F[_] : Sync](fileName: String, bytes: Array[Byte]): F[Unit] = Sync[F].delay {
     Files.write(Paths.get(fileName), bytes)
   }
 
@@ -94,7 +103,7 @@ object RaptorQEncoder {
     (fecParameters, allPackets.flatten)
   }
 
-  def encodeAsSingleBlockA(data: ArraySeq[Byte], symbolSize: Int): (FECParameters, Iterator[EncodingPacket]) = {
+  def encodeAsSingleBlockIterator(data: ArraySeq[Byte], symbolSize: Int): (FECParameters, Iterator[EncodingPacket]) = {
     val fecParameters = FECParameters.newParameters(data.length, symbolSize, 1)
     val topLevelEncoder = OpenRQ.newEncoder(
       ArraySeqUtils.unsafeToByteArray(data),
@@ -122,6 +131,10 @@ object RaptorQEncoder {
     (fecParameters, iterator)
   }
 
+  def encodeAsSingleBlockStream[F[_] : Sync](data: ArraySeq[Byte], symbolSize: Int): (FECParameters, fs2.Stream[F, EncodingPacket]) = {
+    val (fecParameters, iterator) = encodeAsSingleBlockIterator(data, symbolSize)
+    (fecParameters, fs2.Stream.fromIterator[F](iterator))
+  }
 
   private def takeFromJavaIterable[A](n: Int, javaIterable: java.lang.Iterable[A]): mutable.Buffer[A] = {
     var numberLeft = n
@@ -177,8 +190,13 @@ object BatchRaptorQDecoder {
     }
   }
 
-  def feedSinglePacket(packet: EncodingPacket, fecParameters: FECParameters, decoder: DataDecoder): Unit = {
+  def feedSinglePacket(packet: EncodingPacket, fecParameters: FECParameters, decoder: DataDecoder): Boolean = {
     decoder.sourceBlock(packet.sourceBlockNumber()).putEncodingPacket(packet)
+    decoder.isDataDecoded
+  }
+
+  def feedSinglePacketSync[F[_] : Sync](packet: EncodingPacket, fecParameters: FECParameters, decoder: DataDecoder): F[Boolean] = {
+    Sync[F].delay{ feedSinglePacket(packet, fecParameters, decoder) }
   }
 
   def feedPackets(allPackets: Iterable[EncodingPacket], fecParameters: FECParameters, decoder: DataDecoder): Unit = {
@@ -270,11 +288,230 @@ object UdpClient {
           receivePackets
       }
   }
+
+  def downloadFile[F[_] : Concurrent : ContextShift](fileUUID: UUID): F[Unit] = {
+    val dataDecoder = OpenRQ.newDecoder(UdpCommon.defaultFECParameters, 5)
+    var counter: Int = 0
+    GlobalResources
+      .socketResourceLocalhost[F](8011)
+      .use{
+        (socket: Socket[F]) =>
+          val serverAddress = new InetSocketAddress(InetAddress.getByName("localhost"), 8012)
+          val writeOutDummyPacket = socket
+            .write(FileRequest.createFileRequest(serverAddress, new UUID(0, 0)).underlyingPacket)
+            .*>(Sync[F].delay(println("Sent a dummy packet!")))
+          val receivePackets = socket
+            .reads()
+            .concurrently(fs2.Stream.eval(writeOutDummyPacket))
+            .evalTap{_ =>
+              Sync[F].delay(println(s"Packet received")).*>(Sync[F].delay({counter = counter + 1}))
+            }
+//            .map(FileResponsePacket.decode(_, dataDecoder))
+//            .collect{case Some(fileFragment: FileFragment) => fileFragment}
+//            .map(_.toEncodingPacketWithDecoder(dataDecoder))
+//            .evalMap(BatchRaptorQDecoder.feedSinglePacketSync[F](_, UdpCommon.defaultFECParameters, dataDecoder))
+//            .takeWhile(finishedDecoding => !finishedDecoding)
+            .takeWhile(_ => counter <= 3657)
+            .compile
+            .drain
+          //          writeOutDummyPacket.*>(receivePackets)
+          receivePackets
+//            .*>(ArraySeqUtils.writeToFile[F]("output_0.wav", dataDecoder.dataArray()))
+//            .*>(Sync[F].delay(println(s"Counter was ${atomicCounter.get()}")))
+            .*>(socket.write(StopRequest.createStopRequest(serverAddress, new UUID(0, 0)).underlyingPacket))
+      }
+  }
+}
+
+sealed trait RequestCode {
+  def asByte: Byte
+}
+case object FileRequestCode extends RequestCode {
+  override def asByte: Byte = 0
+}
+case object StopRequestCode extends RequestCode {
+  override def asByte: Byte = 1
+}
+
+sealed trait ClientRequest {
+  def requestCode: RequestCode
+}
+
+object ClientRequest {
+  private def decodeFromPacketCanary(clientRequest: ClientRequest): Unit = clientRequest match {
+    case _: FileRequest => ()
+    case _: StopRequest => ()
+  }
+  def decodeFromPacket(udpPacket: Packet): Option[ClientRequest] =
+    FileRequest.decodeFromPacket(udpPacket).orElse(StopRequest.decodeFromPacket(udpPacket))
+}
+
+/**
+ * File request has the following byte structure
+ *
+ * First 16 bytes form a UUID. This UUID uniquely identifies a file and must
+ * negotiated beforehand.
+ *
+ * Optionally, the next 8 bytes can be used to specify a file size.
+ *
+ * Also optionally, the next 8 bytes after that can be used to specify a file hash.
+ *
+ *
+ * @param underlyingPacket
+ */
+final case class FileRequest(underlyingPacket: Packet) extends ClientRequest {
+  // This should be read-only!
+  private def rawBytesOfPacket = underlyingPacket.bytes.toBytes.values
+
+  def getFileUUID: UUID = {
+    val byteBuffer = java.nio.ByteBuffer.wrap(rawBytesOfPacket)
+    val mostSignificantBits = byteBuffer.getLong()
+    val leastSignificantBits = byteBuffer.getLong()
+    new UUID(mostSignificantBits, leastSignificantBits)
+  }
+
+  override def requestCode: FileRequestCode.type = FileRequestCode
+}
+
+object FileRequest {
+  def createFileRequest(remote: InetSocketAddress, fileUUID: UUID): FileRequest = {
+    val sizeOfArray = 1 + 16
+    val byteBuffer = java.nio.ByteBuffer.wrap(Array.fill[Byte](sizeOfArray)(0))
+    byteBuffer.put(FileRequestCode.asByte)
+    byteBuffer.putLong(fileUUID.getMostSignificantBits)
+    byteBuffer.putLong(fileUUID.getLeastSignificantBits)
+    val packet = Packet(remote, Chunk.bytes(byteBuffer.array()))
+    FileRequest(packet)
+  }
+
+  // FIXME: Add additional checks (UUID validity)
+  def decodeFromPacket(udpPacket: Packet): Option[FileRequest] = for {
+    firstByte <- udpPacket.bytes.head
+    result <- if (firstByte == FileRequestCode.asByte) Some(FileRequest(udpPacket)) else None
+  } yield result
+}
+
+final case class StopRequest(underlyingPacket: Packet) extends ClientRequest {
+  // This should be read-only!
+  private def rawBytesOfPacket = underlyingPacket.bytes.toBytes.values
+
+  def getFileUUID: UUID = {
+    val byteBuffer = java.nio.ByteBuffer.wrap(rawBytesOfPacket)
+    // Ignore the first byte
+    byteBuffer.get()
+    val mostSignificantBits = byteBuffer.getLong()
+    val leastSignificantBits = byteBuffer.getLong()
+    new UUID(mostSignificantBits, leastSignificantBits)
+  }
+
+  override def requestCode: StopRequestCode.type = StopRequestCode
+}
+
+object StopRequest {
+  // FIXME: Add additional checks (UUID validity)
+  def decodeFromPacket(udpPacket: Packet): Option[StopRequest] = for {
+    firstByte <- udpPacket.bytes.head
+    result <- if (firstByte == StopRequestCode.asByte) Some(StopRequest(udpPacket)) else None
+  } yield result
+
+  def createStopRequest(remote: InetSocketAddress, fileUUID: UUID): StopRequest = {
+    val arraySize = 1 + 16
+    val byteBuffer = java.nio.ByteBuffer.wrap(Array.fill[Byte](arraySize)(0))
+    byteBuffer.put(StopRequestCode.asByte)
+    byteBuffer.putLong(fileUUID.getMostSignificantBits)
+    byteBuffer.putLong(fileUUID.getLeastSignificantBits)
+    val packet = Packet(remote, Chunk.bytes(byteBuffer.array()))
+    StopRequest(packet)
+  }
+}
+
+sealed trait ResponseStatus {
+  def asByte: Byte
+}
+case object SuccessfulFileResponseFragmentStatus extends ResponseStatus {
+  override def asByte: Byte = 0
+}
+case object FileUUIDNotFoundStatus extends ResponseStatus {
+  override def asByte: Byte =  1
+}
+
+object ResponseStatus {
+  // If you see a warning about an uncovered case here, you need to add that case to addByte
+  private def fromByteCanary(responseStatus: ResponseStatus): Unit = responseStatus match {
+    case SuccessfulFileResponseFragmentStatus => ()
+    case FileUUIDNotFoundStatus => ()
+  }
+  def fromByte(byte: Byte): Option[ResponseStatus] = {
+    if (byte == SuccessfulFileResponseFragmentStatus.asByte) {
+      Some(SuccessfulFileResponseFragmentStatus)
+    } else if (byte == FileUUIDNotFoundStatus.asByte) {
+      Some(FileUUIDNotFoundStatus)
+    } else {
+      None
+    }
+  }
+}
+
+// These packets all
+sealed trait FileResponsePacket
+
+final case class FileFragment(underlyingPacket: Packet) extends FileResponsePacket {
+  def toEncodingPacketWithDecoder(dataDecoder: DataDecoder): EncodingPacket = {
+    EncodingPacket.parsePacket(dataDecoder, underlyingPacket.bytes.toBytes.values, false).value()
+  }
+  def toEncodingPacket(fecParameters: FECParameters): EncodingPacket = {
+    toEncodingPacketWithDecoder(OpenRQ.newDecoder(fecParameters, 5))
+  }
+}
+
+object FileFragment {
+  def encode(inetSocketAddress: InetSocketAddress, encodingPacket: EncodingPacket): FileFragment = {
+    FileFragment(Packet(inetSocketAddress, Chunk.bytes(encodingPacket.asArray())))
+  }
+}
+
+final case class FileUUIDNotFound(underlyingPacket: Packet) extends FileResponsePacket
+object FileUUIDNotFound {
+  def encode(inetSocketAddress: InetSocketAddress, uuid: UUID): FileUUIDNotFound = {
+    val lengthOfArray = 1 + 4 // One byte for the initial response and then 4 for the UUID
+    val rawBytes = Array.fill[Byte](lengthOfArray)(0)
+    rawBytes(0) = FileUUIDNotFoundStatus.asByte
+    val byteBuffer = ByteBuffer.wrap(rawBytes, 1, 4)
+    byteBuffer.putLong(uuid.getMostSignificantBits)
+    byteBuffer.putLong(uuid.getLeastSignificantBits)
+    FileUUIDNotFound(Packet(inetSocketAddress, Chunk.bytes(byteBuffer.array())))
+  }
+}
+
+object FileResponsePacket {
+  def decode(udpPacket: Packet, dataDecoder: DataDecoder): Option[FileResponsePacket] = {
+    if (udpPacket.bytes.size > 1000) {
+      Some(FileFragment(udpPacket))
+    } else {
+      ResponseStatus.fromByte(udpPacket.bytes(0)).map{
+        case SuccessfulFileResponseFragmentStatus => FileFragment(udpPacket)
+        case FileUUIDNotFoundStatus => FileUUIDNotFound(udpPacket)
+      }
+    }
+  }
+
+  def lookupStatus(fileResponsePacket: FileResponsePacket): ResponseStatus = fileResponsePacket match {
+    case _: FileFragment => SuccessfulFileResponseFragmentStatus
+    case _: FileUUIDNotFound => FileUUIDNotFoundStatus
+  }
+}
+
+object UdpCommon {
+  val uuidToFileName: Map[UUID, Path] = Map(
+    new UUID(0L, 0L) -> Paths.get("Track 10.wav")
+  )
+
+  val defaultFECParameters: FECParameters = FECParameters.newParameters(36510210, 10000, 1)
 }
 
 object UdpServer {
 
-  val myBytes = ArraySeq.from(Range(1, 100).map(int => int.toByte))
+  val myBytes: ArraySeq[Byte] = ArraySeq.from(Range(1, 100).map(int => int.toByte))
 
   val (fecParameters1, udpPackets) = UdpProcessing.sendAsUdp(myBytes)
 
@@ -293,6 +530,62 @@ object UdpServer {
       }
       .toList
       .traverse_(udpPacket => Sync[F].delay(println(s"Writing out this UDP packet: $udpPacket"))*>(socket.write(udpPacket, Some(FiniteDuration(1, TimeUnit.SECONDS)))))
+  }
+
+  def respondToRequest[F[_] : Sync](request: FileRequest): fs2.Stream[F, FileResponsePacket] = {
+    val requestAddress = request.underlyingPacket.remote
+    UdpCommon.uuidToFileName.get(request.getFileUUID) match {
+      case None => fs2.Stream(FileUUIDNotFound.encode(requestAddress, request.getFileUUID))
+      case Some(path) =>
+        for {
+          // FIXME need to account for lack of path
+          bytes <- fs2.Stream.eval(ArraySeqUtils.readFromPath[F](path))
+          encodingPacket <- RaptorQEncoder.encodeAsSingleBlockStream(bytes, 10000)._2
+        } yield FileFragment.encode(requestAddress, encodingPacket)
+    }
+  }
+
+  def fullResponse[F[_] : Concurrent](incomingPackets: fs2.Stream[F, Packet]): fs2.Stream[F, FileResponsePacket] = {
+    for {
+      fileRequestQueue <- fs2.Stream.eval(fs2.concurrent.Queue.bounded[F, FileRequest](10))
+      stopQueue <- fs2.Stream.eval(fs2.concurrent.Topic(StopRequest.createStopRequest(new InetSocketAddress(InetAddress.getLocalHost, 80), new UUID(0, 0))))
+      result <- fileRequestQueue
+        .dequeue
+        .map{request =>
+          val stopSignal = stopQueue
+            .subscribe(10)
+            .map{stopRequest =>
+              println(s"STOP REQUEST UUID: ${stopRequest.getFileUUID}")
+              println(s"REQUEST UUID: ${request.getFileUUID}")
+              val fileUUIDsAgree = stopRequest.getFileUUID == request.getFileUUID
+              println(s"STOP REQUEST address: ${stopRequest.underlyingPacket.remote}")
+              println(s"REQUEST address: ${request.underlyingPacket.remote}")
+              val addressesAgree = stopRequest.underlyingPacket.remote == request.underlyingPacket.remote
+              fileUUIDsAgree && addressesAgree
+            }
+            .evalTap(stopSignal => Sync[F].delay(println(s"Stop signal is $stopSignal")))
+            .takeWhile(x => !x, false)
+            .append(fs2.Stream.eval(Sync[F].delay(println("Stop signal is shutting down..."))).drain)
+          respondToRequest[F](request)
+            .interruptWhen(stopSignal)
+            .append(fs2.Stream.eval(Sync[F].delay(println("Stream is shutting down..."))).drain)
+        }
+        .parJoin(5)
+        .concurrently{
+          incomingPackets
+            .evalTap(packet => Sync[F].delay(println(s"SERVER RECEIVED: $packet")))
+            .map(ClientRequest.decodeFromPacket)
+            .collect{case Some(x) => x}
+            .evalMap{
+              case request: FileRequest =>
+                println(s"This was a file request: $request")
+                fileRequestQueue.enqueue1(request)
+              case request: StopRequest =>
+                println(s"This was a stop request: $request")
+                stopQueue.publish1(request)
+            }
+        }
+    } yield result
   }
 
   def respondToIncomingPacket[F[_] : Sync](udpPacket: Packet, socket: Socket[F]): F[Unit] = {
@@ -314,6 +607,19 @@ object UdpServer {
             .drain
       }
   }
+
+  def fullRun[F[_] : Concurrent: ContextShift]: F[Unit] = {
+    GlobalResources.socketResourceLocalhost[F](8012)
+      .use{
+        readSocket: Socket[F] =>
+          fullResponse(readSocket.reads())
+            .map{
+              case fileFragment: FileFragment => fileFragment.underlyingPacket
+              case fileUUIDNotFound: FileUUIDNotFound => fileUUIDNotFound.underlyingPacket
+            }
+            .through(readSocket.writes()).compile.drain
+      }
+  }
 }
 
 object Main extends IOApp {
@@ -326,9 +632,9 @@ object Main extends IOApp {
     println(s"Hello world!: $result")
 
     val action = if (args(1) == "client") {
-      UdpClient.run[IO]
+      UdpClient.downloadFile[IO](new UUID(0, 0))
     } else if (args(1) == "server") {
-      UdpServer.run[IO]
+      UdpServer.fullRun[IO]
     } else {
       IO{
         Thread.sleep(20000)
