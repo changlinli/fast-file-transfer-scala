@@ -306,18 +306,17 @@ object UdpClient {
             .evalTap{_ =>
               Sync[F].delay(println(s"Packet received")).*>(Sync[F].delay({counter = counter + 1}))
             }
-//            .map(FileResponsePacket.decode(_, dataDecoder))
-//            .collect{case Some(fileFragment: FileFragment) => fileFragment}
-//            .map(_.toEncodingPacketWithDecoder(dataDecoder))
-//            .evalMap(BatchRaptorQDecoder.feedSinglePacketSync[F](_, UdpCommon.defaultFECParameters, dataDecoder))
-//            .takeWhile(finishedDecoding => !finishedDecoding)
-            .takeWhile(_ => counter <= 3657)
+            .map(FileResponsePacket.decode(_, dataDecoder))
+            .collect{case Some(fileFragment: FileFragment) => fileFragment}
+            .map(_.toEncodingPacketWithDecoder(dataDecoder))
+            .evalMap(BatchRaptorQDecoder.feedSinglePacketSync[F](_, UdpCommon.defaultFECParameters, dataDecoder))
+            .takeWhile(finishedDecoding => !finishedDecoding)
             .compile
             .drain
           //          writeOutDummyPacket.*>(receivePackets)
           receivePackets
-//            .*>(ArraySeqUtils.writeToFile[F]("output_0.wav", dataDecoder.dataArray()))
-//            .*>(Sync[F].delay(println(s"Counter was ${atomicCounter.get()}")))
+            .*>(ArraySeqUtils.writeToFile[F]("output_0.wav", dataDecoder.dataArray()))
+            .*>(Sync[F].delay(println(s"Counter was ${counter}")))
             .*>(socket.write(StopRequest.createStopRequest(serverAddress, new UUID(0, 0)).underlyingPacket))
       }
   }
