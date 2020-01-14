@@ -2,13 +2,13 @@ package com.changlinli.raptorqdemo
 
 import java.io.DataOutput
 import java.{lang, util}
-import java.net.{InetAddress, InetSocketAddress}
+import java.net.{DatagramPacket, DatagramSocket, InetAddress, InetSocketAddress}
 import java.nio.ByteBuffer
 import java.nio.channels.WritableByteChannel
 import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.{ExecutorService, Executors, TimeUnit}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
+import java.util.concurrent.{Callable, ExecutorService, Executors, TimeUnit}
 
 import cats.Monad
 import cats.effect.{Blocker, Concurrent, ContextShift, ExitCode, IO, IOApp, Resource, Sync}
@@ -19,16 +19,19 @@ import net.fec.openrq.decoder.DataDecoder
 import net.fec.openrq.parameters.{FECParameters, ParameterChecker}
 import net.fec.openrq.{EncodingPacket, OpenRQ, SerializablePacket, SymbolType}
 
-import scala.collection.immutable.ArraySeq
+import scala.collection.immutable.{ArraySeq, Queue, SortedSet}
 import scala.collection.immutable.ArraySeq.ofByte
 import scala.collection.mutable
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.FiniteDuration
 import scala.io.Source
 import scala.jdk.CollectionConverters._
+import scala.jdk.FunctionConverters._
+import scala.jdk.FutureConverters._
 import scala.collection.parallel.CollectionConverters._
 import scala.collection.parallel.{ForkJoinTaskSupport, ParIterable, ParSeq}
 import scala.language.higherKinds
+import scala.util.control.Breaks
 
 sealed trait BatchDecodeErrors
 final case class ProbabilisticDecodeFailure() extends BatchDecodeErrors
@@ -48,8 +51,12 @@ object ArraySeqUtils {
     ArraySeq.unsafeWrapArray(Files.readAllBytes(Paths.get(fileName)))
   }
 
-  def readFromPath[F[_] : Sync](path: Path): F[ArraySeq[Byte]] = Sync[F].delay{
+  def unsafeReadFromPath(path: Path): ArraySeq[Byte] = {
     ArraySeq.unsafeWrapArray(Files.readAllBytes(path))
+  }
+
+  def readFromPath[F[_] : Sync](path: Path): F[ArraySeq[Byte]] = Sync[F].delay{
+    unsafeReadFromPath(path)
   }
 
   def writeToFile[F[_] : Sync](fileName: String, bytes: Array[Byte]): F[Unit] = Sync[F].delay {
@@ -258,6 +265,15 @@ object GlobalResources {
   def socketResourceLocalhost[F[_] : Concurrent : ContextShift](port: Int): Resource[F, Socket[F]] = blockerResource
     .flatMap(blocker => SocketGroup[F](blocker))
     .flatMap(socketGroup => socketGroup.open[F](new InetSocketAddress(port)))
+
+  def makeDatagramSocket[F[_] : Sync](port: Int): Resource[F, DatagramSocket] = {
+    Resource.make{
+      Sync[F].delay{
+        val socket = new DatagramSocket(port)
+        socket
+      }
+    }(socket => Sync[F].delay(socket.close()))
+  }
 
 }
 
@@ -498,6 +514,11 @@ object FileResponsePacket {
     case _: FileFragment => SuccessfulFileResponseFragmentStatus
     case _: FileUUIDNotFound => FileUUIDNotFoundStatus
   }
+
+  def encode(fileResponsePacket: FileResponsePacket): Packet = fileResponsePacket match {
+    case FileFragment(underlyingPacket) => underlyingPacket
+    case FileUUIDNotFound(underlyingPacket) => underlyingPacket
+  }
 }
 
 object UdpCommon {
@@ -506,6 +527,72 @@ object UdpCommon {
   )
 
   val defaultFECParameters: FECParameters = FECParameters.newParameters(36510210, 10000, 1)
+
+  def updateAndGetMoreInfo[A, B](atomicReference: AtomicReference[A])(f: A => Option[(B, A)]): Either[A, (B, A)] = {
+    val updateF = (x: A) => f(x).map{case (_, newState) => newState}.getOrElse(x)
+    val preGet = atomicReference.getAndUpdate(updateF.asJavaUnaryOperator)
+    f(preGet).toRight(preGet)
+  }
+}
+
+sealed abstract case class UniqueQueue[A](toQueue: Queue[A], private val uniquenessSet: Set[A]) {
+
+  def dequeueOption: Option[(A, UniqueQueue[A])] = {
+    toQueue.dequeueOption.map{
+      case (x, newQueue) => (x, new UniqueQueue(newQueue, uniquenessSet - x) {})
+    }
+  }
+
+  def enqueue(x: A): UniqueQueue[A] = {
+    if (uniquenessSet.contains(x)) {
+      this
+    } else {
+      new UniqueQueue(toQueue.enqueue(x), uniquenessSet + x) {}
+    }
+  }
+
+  def size: Int = toQueue.size
+
+  def length: Int = toQueue.length
+
+}
+
+object UniqueQueue {
+  def empty[A]: UniqueQueue[A] = new UniqueQueue[A](Queue.empty[A], Set.empty[A]) {}
+}
+
+final case class ServerState(
+  currentRequestsBeingProcessed: Set[FileRequest],
+  filesWaitingTransfer: UniqueQueue[FileRequest]
+) {
+  def markBeingProcessed: Option[(FileRequest, ServerState)] = {
+    filesWaitingTransfer.dequeueOption.map{
+      case (requestToProcess, newQueue) =>
+        val newState = ServerState(currentRequestsBeingProcessed + requestToProcess, newQueue)
+        (requestToProcess, newState)
+    }
+  }
+
+  def markClientRequestReceived(request: ClientRequest): ServerState = request match {
+    case fileRequest: FileRequest => markFileRequestReceived(fileRequest)
+    case cancellationRequest: StopRequest => markCancellationRequestReceived(cancellationRequest)
+  }
+
+  def markFileRequestReceived(request: FileRequest): ServerState = {
+    this.copy(filesWaitingTransfer = filesWaitingTransfer.enqueue(request))
+  }
+
+  def markCancellationRequestReceived(requestToCancel: StopRequest): ServerState = {
+    val correspondingFileRequest = FileRequest.createFileRequest(
+      requestToCancel.underlyingPacket.remote,
+      requestToCancel.getFileUUID
+    )
+    this.copy(currentRequestsBeingProcessed = currentRequestsBeingProcessed - correspondingFileRequest)
+  }
+}
+
+object ServerState {
+  def empty: ServerState = ServerState(Set.empty, UniqueQueue.empty)
 }
 
 object UdpServer {
@@ -544,12 +631,91 @@ object UdpServer {
     }
   }
 
+  val serverState: AtomicReference[ServerState] =
+    new AtomicReference[ServerState](ServerState(Set.empty, UniqueQueue.empty[FileRequest]))
+
+  def transferFile(request: FileRequest): Iterator[FileResponsePacket] = {
+    val requestAddress = request.underlyingPacket.remote
+    UdpCommon.uuidToFileName.get(request.getFileUUID) match {
+      case None =>
+        Iterator.single(FileUUIDNotFound.encode(requestAddress, request.getFileUUID))
+      case Some(path) =>
+        val bytes = ArraySeqUtils.unsafeReadFromPath(path)
+        val encodingPackets = RaptorQEncoder.encodeAsSingleBlockIterator(bytes, 10000)._2
+        encodingPackets.map(FileFragment.encode(requestAddress, _))
+    }
+  }
+
+  def unsafeProcessResponsePacket(fileResponsePacket: FileResponsePacket, datagramSocket: DatagramSocket): Unit = {
+    val packet = FileResponsePacket.encode(fileResponsePacket)
+    val byteBuffer = packet.bytes.toByteBuffer
+    val datagramPacket = new DatagramPacket(byteBuffer.array(), byteBuffer.arrayOffset(), packet.bytes.size)
+    datagramPacket.setSocketAddress(packet.remote)
+    datagramSocket.send(datagramPacket)
+  }
+
+  def unsafeProcessOneElementOfServerState(serverState: AtomicReference[ServerState], datagramSocket: DatagramSocket): Unit = {
+    UdpCommon.updateAndGetMoreInfo(serverState)(_.markBeingProcessed) match {
+      case Right((fileRequest, _)) =>
+        val iterator = transferFile(fileRequest)
+        var i = 0
+        Breaks.breakable{
+          iterator.foreach{packet =>
+            unsafeProcessResponsePacket(packet, datagramSocket)
+            if (i % 100 == 0) {
+              val stillShouldProcess = serverState.get().currentRequestsBeingProcessed.contains(fileRequest)
+              if (!stillShouldProcess) {
+                Breaks.break()
+              }
+            }
+            i += 1
+          }
+        }
+      case Left(_) => ()
+    }
+  }
+
+  def processOneElementOfServerState[F[_] : Sync](serverState: AtomicReference[ServerState], datagramSocket: DatagramSocket): F[Unit] = {
+    Sync[F].delay(unsafeProcessOneElementOfServerState(serverState, datagramSocket))
+  }
+
+
+  def unsafeBlockingListenToSocketOnce(socket: DatagramSocket): ClientRequest = {
+    val packetReadBuffer: Array[Byte] = Array.fill[Byte](20000)(0)
+    val packet = new DatagramPacket(packetReadBuffer, packetReadBuffer.length)
+    socket.receive(packet);
+    println(s"Received a packet!: $packet")
+    val inetSocketAddress: InetSocketAddress = packet
+      .getSocketAddress
+      // The Java implementation returns an InetSocketAddress it just upcasts to SocketAddress
+      .asInstanceOf[InetSocketAddress]
+    val chunk = Chunk.bytes(packet.getData, packet.getOffset, packet.getLength)
+    val fs2Packet = Packet(inetSocketAddress, chunk)
+    // FIXME
+    ClientRequest.decodeFromPacket(fs2Packet).get
+  }
+
+  def unsafeDealWithRequest(serverState: AtomicReference[ServerState], clientRequest: ClientRequest): Unit = {
+    serverState.getAndUpdate(_.markClientRequestReceived(clientRequest))
+    println(s"Updated server state! ${serverState.get()}")
+  }
+
+  def unsafeBlockingDealWithSocketOnce(socket: DatagramSocket, serverState: AtomicReference[ServerState]): Unit = {
+    val request = unsafeBlockingListenToSocketOnce(socket)
+    unsafeDealWithRequest(serverState, request)
+  }
+
+  def dealWithSocketOnce[F[_] : Sync : ContextShift](blocker: Blocker, socket: DatagramSocket, serverState: AtomicReference[ServerState]): F[Unit] = {
+    blocker.blockOn(Sync[F].delay(unsafeBlockingDealWithSocketOnce(socket, serverState)))
+  }
+
   def fullResponse[F[_] : Concurrent](incomingPackets: fs2.Stream[F, Packet]): fs2.Stream[F, FileResponsePacket] = {
     for {
       fileRequestQueue <- fs2.Stream.eval(fs2.concurrent.Queue.bounded[F, FileRequest](10))
       stopQueue <- fs2.Stream.eval(fs2.concurrent.Topic(StopRequest.createStopRequest(new InetSocketAddress(InetAddress.getLocalHost, 80), new UUID(0, 0))))
       result <- fileRequestQueue
         .dequeue
+        .concurrently(stopQueue.subscribers.evalTap(numOfSubscribers => Sync[F].delay(println(s"NUM OF SUBSCRIBERS: $numOfSubscribers"))))
         .map{request =>
           val stopSignal = stopQueue
             .subscribe(10)
@@ -608,16 +774,29 @@ object UdpServer {
   }
 
   def fullRun[F[_] : Concurrent: ContextShift]: F[Unit] = {
-    GlobalResources.socketResourceLocalhost[F](8012)
+    GlobalResources.blockerResource[F]
+      .flatMap(blocker => GlobalResources.makeDatagramSocket[F](8012).map((blocker, _)))
       .use{
-        readSocket: Socket[F] =>
-          fullResponse(readSocket.reads())
-            .map{
-              case fileFragment: FileFragment => fileFragment.underlyingPacket
-              case fileUUIDNotFound: FileUUIDNotFound => fileUUIDNotFound.underlyingPacket
-            }
-            .through(readSocket.writes()).compile.drain
+        case (blocker, socket) =>
+          val processingStateStream = fs2.Stream
+            .constant[F, fs2.Stream[F, Unit]](fs2.Stream.eval(processOneElementOfServerState[F](UdpServer.serverState, socket)), 1)
+            .parJoin(5)
+          val listeningToSocketStream = fs2.Stream.repeatEval(dealWithSocketOnce(blocker, socket, UdpServer.serverState))
+          listeningToSocketStream
+            .evalMap(_ => Concurrent[F].start(processOneElementOfServerState[F](UdpServer.serverState, socket)))
+            .compile
+            .drain
       }
+//    GlobalResources.socketResourceLocalhost[F](8012)
+//      .use{
+//        readSocket: Socket[F] =>
+//          fullResponse(readSocket.reads())
+//            .map{
+//              case fileFragment: FileFragment => fileFragment.underlyingPacket
+//              case fileUUIDNotFound: FileUUIDNotFound => fileUUIDNotFound.underlyingPacket
+//            }
+//            .through(readSocket.writes()).compile.drain
+//      }
   }
 }
 

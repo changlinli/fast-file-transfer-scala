@@ -23,4 +23,5 @@ assemblyMergeStrategy in assembly := {
 Test / fork := true
 Test / javaOptions += "-Xmx16G"
 Compile / run / fork := true
+Compile / run / javaOptions += "-Xlog:gc*:stdout:tid,time,uptime"
 connectInput in run := true
