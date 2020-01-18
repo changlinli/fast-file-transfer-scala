@@ -57,10 +57,10 @@ class TestRaptorCode extends AnyFlatSpec with Matchers {
       _ <- IO.sleep(FiniteDuration(1, TimeUnit.SECONDS))
       serverFiber <- serverAction.start
       _ <- serverFiber.join
-      _ <- clientFiber.join
-    } yield ()
+      fileDownloaded <- clientFiber.join
+    } yield fileDownloaded
 
-    combinedAction.unsafeRunSync()
+    combinedAction.unsafeRunSync().length should be (36510210)
     //    val myBytes = ArraySeq.from(Range(1, 100).map(int => int.toByte))
 //    val (fecParameters, encodedBytes) = RaptorQEncoder.encode(myBytes, 2, 5)
 //    val filterToOnlyOneSourceBlock = encodedBytes.filter(packet => packet.sourceBlockNumber() == 1)

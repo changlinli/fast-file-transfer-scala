@@ -15,6 +15,7 @@ import cats.effect.{Blocker, Concurrent, ContextShift, ExitCode, IO, IOApp, Reso
 import cats.implicits._
 import fs2.Chunk
 import fs2.io.udp.{Packet, Socket, SocketGroup}
+import grizzled.slf4j.Logging
 import net.fec.openrq.decoder.DataDecoder
 import net.fec.openrq.parameters.{FECParameters, ParameterChecker}
 import net.fec.openrq.{EncodingPacket, OpenRQ, SerializablePacket, SymbolType}
@@ -283,7 +284,7 @@ object GlobalResources {
 
 }
 
-object UdpClient {
+object UdpClient extends Logging {
   val myBytes = ArraySeq.from(Range(1, 100).map(int => int.toByte))
 
   val (fecParameters1, udpPackets) = UdpProcessing.sendAsUdp(myBytes)
@@ -333,42 +334,43 @@ object UdpClient {
     }
   }
 
-  def unsafeDownloadFile(socket: DatagramSocket): Unit = {
+  def unsafeDownloadFile(socket: DatagramSocket): ArraySeq[Byte] = {
     val dataDecoder = OpenRQ.newDecoder(UdpCommon.defaultFECParameters, 5)
     val serverAddress = new InetSocketAddress(InetAddress.getByName("localhost"), 8012)
     val packet = FileRequest.createFileRequest(serverAddress, new UUID(0, 0)).underlyingPacket
     val fileRequestDatagramPacket = UdpCommon.datagramPacketFromFS2Packet(packet)
     val downloadIterator = unsafeBlockingPacketIterator(socket)
-      .|>(tapIterator(_)(_ => println("A")))
+      .|>(tapIterator(_)(packet => logger.debug(s"Raw datagram packet: $packet")))
       .map(UdpCommon.fs2packetFromDatagramPacket)
-      .|>(tapIterator(_)(_ => println("B")))
+      .|>(tapIterator(_)(fs2Packet => logger.debug(s"Decoded FS2 packet: $fs2Packet")))
       .map(FileResponsePacket.decode(_, dataDecoder))
-      .|>(tapIterator(_)(_ => println("C")))
+      .|>(tapIterator(_)(serverResponseOpt => logger.debug(s"After attempting to decode a packet as a response from the server: $serverResponseOpt")))
       .collect{case Some(fileFragment: FileFragment) => fileFragment}
-      .|>(tapIterator(_)(_ => println("D")))
+      .|>(tapIterator(_)(serverResponse => logger.debug(s"After decoding server response: $serverResponse")))
       .map(_.toEncodingPacketWithDecoder(dataDecoder))
-      .|>(tapIterator(_)(_ => println("E")))
+      .|>(tapIterator(_)(encodingPacket => logger.debug(s"After converting it to a Raptor packet: $encodingPacket")))
       .map(BatchRaptorQDecoder.feedSinglePacket(_, UdpCommon.defaultFECParameters, dataDecoder))
-      .|>(tapIterator(_)(_ => println("F")))
+      .|>(tapIterator(_)(decodeResult => logger.debug(s"After feeding the packet to our decoder have we successfully decoded yet? $decodeResult")))
       .takeWhile(finishedDecoding => !finishedDecoding)
-      .|>(tapIterator(_)(_ => println("G")))
+      .|>(tapIterator(_)(_ => logger.debug("Finished decoding!")))
 
     socket.send(fileRequestDatagramPacket)
-    println("Sent file request")
+    logger.info("Sent file request")
     var i = 0
     downloadIterator.foreach{_ =>
-      println(s"Processed packet: $i")
+      logger.debug(s"Processed packet: $i")
       i += 1
     }
     val stopRequest = StopRequest.createStopRequest(serverAddress, new UUID(0, 0)).underlyingPacket
     socket.send(UdpCommon.datagramPacketFromFS2Packet(stopRequest))
+    ArraySeq.unsafeWrapArray(dataDecoder.dataArray())
   }
 
-  def downloadFileAA[F[_] : Sync : ContextShift](blocker: Blocker, socket: DatagramSocket): F[Unit] = {
+  def downloadFileAA[F[_] : Sync : ContextShift](blocker: Blocker, socket: DatagramSocket): F[ArraySeq[Byte]] = {
     blocker.blockOn(Sync[F].delay(unsafeDownloadFile(socket)))
   }
 
-  def downloadFileA[F[_] : Sync : ContextShift](fileUUID: UUID): F[Unit] = {
+  def downloadFileA[F[_] : Sync : ContextShift](fileUUID: UUID): F[ArraySeq[Byte]] = {
     GlobalResources.blockerResource[F]
       .flatMap(blocker => GlobalResources.makeDatagramSocket(8011).map((_, blocker)))
 //      .flatMap(blocker => DummySocket.asResource[F](8011).map((_, blocker)))
@@ -564,26 +566,20 @@ object FileFragment {
 }
 
 final case class FileUUIDNotFound(underlyingPacket: Packet) extends FileResponsePacket
-object FileUUIDNotFound {
+object FileUUIDNotFound extends Logging {
   def encode(inetSocketAddress: InetSocketAddress, uuid: UUID): FileUUIDNotFound = {
     try {
-      println("ENCODEA")
       val lengthOfArray = 1 + 16 // One byte for the initial response and then 4 for the UUID
-      println("ENCODEB")
       val rawBytes = Array.fill[Byte](lengthOfArray)(0)
-      println("ENCODEC")
       rawBytes(0) = FileUUIDNotFoundStatus.asByte
-      println("ENCODED")
       val byteBuffer = ByteBuffer.wrap(rawBytes, 1, 16)
-      println("ENCODEE")
       byteBuffer.putLong(uuid.getMostSignificantBits)
-      println("ENCODEF")
       byteBuffer.putLong(uuid.getLeastSignificantBits)
-      println("ENCODEG")
       FileUUIDNotFound(Packet(inetSocketAddress, Chunk.bytes(byteBuffer.array())))
     } catch {
       case exception: Exception =>
-        println(exception)
+        // FIXME: Need to figure out why this error isn't actually being thrown further up
+        logger.error(exception)
         throw exception
     }
   }
@@ -705,7 +701,7 @@ object ServerState {
   def empty: ServerState = ServerState(Set.empty, UniqueQueue.empty)
 }
 
-object UdpServer {
+object UdpServer extends Logging {
 
   val myBytes: ArraySeq[Byte] = ArraySeq.from(Range(1, 100).map(int => int.toByte))
 
@@ -745,41 +741,33 @@ object UdpServer {
     new AtomicReference[ServerState](ServerState(Set.empty, UniqueQueue.empty[FileRequest]))
 
   def transferFile(request: FileRequest): Iterator[FileResponsePacket] = {
-    println(s"REQUEST: $request")
-    println("HELLOA")
+    logger.info(s"REQUEST: $request")
     val requestAddress = request.address
-    println("HELLOB")
     val result = UdpCommon.uuidToFileName.get(request.fileUUID) match {
       case None =>
-        println("HELLOC")
         Iterator.single(FileUUIDNotFound.encode(requestAddress, request.fileUUID))
       case Some(path) =>
-        println("HELLOD")
         val bytes = ArraySeqUtils.unsafeReadFromPath(path)
-        println("HELLOE")
         val encodingPackets = RaptorQEncoder.encodeAsSingleBlockIterator(bytes, 10000)._2
-        println("HELLOF")
         encodingPackets.map(FileFragment.encode(requestAddress, _))
     }
-    println("HELLOG")
     result
   }
 
   def unsafeProcessResponsePacket(fileResponsePacket: FileResponsePacket, datagramSocket: DatagramSocket): Unit = {
-    println("Beginning processing")
     val packet = FileResponsePacket.encode(fileResponsePacket)
     val datagramPacket = UdpCommon.datagramPacketFromFS2Packet(packet)
-    println("About to send to socket...")
     datagramSocket.send(datagramPacket)
+    logger.debug("Sent file response packet")
   }
 
   def unsafeProcessOneElementOfServerState(serverState: AtomicReference[ServerState], datagramSocket: DatagramSocket): Unit = {
-    println("Receive request to process one element")
+    logger.info("Received prompt to analyze server state once")
     UdpCommon.updateAndGetMoreInfo(serverState)(_.markBeingProcessed) match {
       case Right((fileRequest, _)) =>
-        println("Updated state successfully")
+        logger.info("Updated state successfully")
         val iterator = transferFile(fileRequest)
-        println("Created iterator!")
+        logger.info("Created iterator!")
         var i = 0
         Breaks.breakable{
           iterator.foreach{packet =>
@@ -789,13 +777,13 @@ object UdpServer {
               if (!stillShouldProcess) {
                 Breaks.break()
               }
-              println(s"WE'VE processed: $i")
+              logger.debug(s"WE'VE processed: $i")
             }
             i += 1
           }
         }
       case Left(x) =>
-        println(s"No outstanding requests so not doing anything...: $x")
+        logger.info(s"No outstanding requests so not doing anything...: $x")
         ()
     }
   }
@@ -815,9 +803,9 @@ object UdpServer {
   }
 
   def unsafeDealWithRequest(serverState: AtomicReference[ServerState], clientRequest: ClientRequest): Unit = {
-    println(s"Received this client request: $clientRequest")
+    logger.info(s"Received this client request: $clientRequest")
     serverState.getAndUpdate(_.markClientRequestReceived(clientRequest))
-    println(s"Updated server state! ${serverState.get().abbreviatedToString}")
+    logger.info(s"Updated server state! ${serverState.get().abbreviatedToString}")
   }
 
   def unsafeBlockingDealWithSocketOnce(socket: DatagramSocket, serverState: AtomicReference[ServerState]): Unit = {
@@ -918,7 +906,7 @@ object UdpServer {
   }
 }
 
-final class DummySocket(val port: Int) extends DatagramSocket {
+final class DummySocket(val port: Int) extends DatagramSocket with Logging {
 
   private def copyDatagramPacket(packet: DatagramPacket): DatagramPacket = {
     val newBackingArray = Array.fill[Byte](packet.getLength)(0)
@@ -930,25 +918,28 @@ final class DummySocket(val port: Int) extends DatagramSocket {
 
   override def send(p: DatagramPacket): Unit = {
     // FIXME deal with this cast
-    val packetPort = p.getSocketAddress.asInstanceOf[InetSocketAddress].getPort
-//    println("Sending packet...")
-    val packetCopy = copyDatagramPacket(p)
-    // We want to mark where this packet came from
-    packetCopy.setPort(port)
-    DummySocket.udpChannels.compute(
-      UdpPort(packetPort), (_, queue) => {
-        if (queue == null) {
-          Queue(packetCopy)
-        } else {
-          queue.enqueue(packetCopy)
-        }
-      }
-    )
+    p.getSocketAddress match {
+      case inetSocketAddress: InetSocketAddress =>
+        val packetPort = inetSocketAddress.getPort
+        val packetCopy = copyDatagramPacket(p)
+        // We want to mark where this packet came from
+        packetCopy.setPort(port)
+        DummySocket.udpChannels.compute(
+          UdpPort(packetPort), (_, queue) => {
+            if (queue == null) {
+              Queue(packetCopy)
+            } else {
+              queue.enqueue(packetCopy)
+            }
+          }
+        )
+      case notInetSocketAddress =>
+        logger.warn(s"Dropping this packet: $p because its socket address was not an InetSocketAddress but was instead a ${p.getSocketAddress}")
+    }
   }
 
   @tailrec
   override def receive(p: DatagramPacket): Unit = {
-//    println("Receiving packet...")
     // Yay Java APIs for maximum ugliness!
     var element: Option[DatagramPacket] = None
     DummySocket.udpChannels.compute(
@@ -1011,7 +1002,7 @@ object Main extends IOApp {
     println(s"Hello world!: $result")
 
     val action = if (args(1) == "client") {
-      UdpClient.downloadFileA[IO](new UUID(0, 0))
+      UdpClient.downloadFileA[IO](new UUID(0, 0)).map(_ => ())
     } else if (args(1) == "server") {
       UdpServer.fullRun[IO]
     } else if (args(1) == "combined") {
