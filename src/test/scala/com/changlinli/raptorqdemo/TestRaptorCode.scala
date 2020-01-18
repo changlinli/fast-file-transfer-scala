@@ -46,7 +46,7 @@ class TestRaptorCode extends AnyFlatSpec with Matchers {
           listeningToSocketStream
             .evalMap(_ => Concurrent[IO].start(processOneElementOfServerState[IO](UdpServer.serverState, socket)))
             // Purely for testing to make sure that we actually terminate the test
-            .evalMap(_ => IO(UdpServer.serverState.get().currentRequestsBeingProcessed.isEmpty))
+            .evalMap(_ => IO(UdpServer.serverState.get().currentClientDownloadRequestsBeingProcessed.isEmpty))
             .takeWhile(x => !x)
             .compile
             .drain
@@ -61,6 +61,41 @@ class TestRaptorCode extends AnyFlatSpec with Matchers {
     } yield fileDownloaded
 
     combinedAction.unsafeRunSync().length should be (36510210)
+  }
+  it should "work with uploads" in {
+    val fileNameOnDisk = "Track 10.wav"
+    // FIXME
+    val fileName = BoundedString.fromString("random file").get
+    val serverAction = GlobalResources.blockerResource[IO]
+      .flatMap(blocker => DummySocket.asResource[IO](8012).map(socket => (blocker, socket)))
+      .use{
+        case (blocker, socket) =>
+          val listeningToSocketStream = fs2.Stream.repeatEval(dealWithSocketOnce[IO](blocker, socket, UdpServer.serverState))
+          listeningToSocketStream
+            .evalMap(_ => Concurrent[IO].start(processOneElementOfServerState[IO](UdpServer.serverState, socket)))
+            // Purely for testing to make sure that we actually terminate the test
+            .evalMap(_ => IO(UdpServer.serverState.get().currentClientDownloadRequestsBeingProcessed.isEmpty))
+            .takeWhile(x => !x)
+            .compile
+            .drain
+      }
+    val clientAction = GlobalResources.blockerResource[IO]
+      .flatMap(blocker => GlobalResources.makeDatagramSocket[IO](8011).map((_, blocker)))
+      .use{
+        case (socket, blocker) =>
+          for {
+            fileBytes <- ArraySeqUtils.readFromFile[IO](fileNameOnDisk)
+            _ <- UdpClient.uploadFile[IO](blocker, socket, fileBytes, new InetSocketAddress(8012), new UUID(1L, 1L), fileName)
+          } yield ()
+      }
+    val combinedAction = for {
+      clientFiber <- clientAction.start
+      _ <- IO.sleep(FiniteDuration(1, TimeUnit.SECONDS))
+      serverFiber <- serverAction.start
+      _ <- serverFiber.join
+      fileDownloaded <- clientFiber.join
+    } yield fileDownloaded
+    combinedAction.unsafeRunSync()
   }
 
 }

@@ -5,6 +5,7 @@ import java.{lang, util}
 import java.net.{DatagramPacket, DatagramSocket, InetAddress, InetSocketAddress}
 import java.nio.ByteBuffer
 import java.nio.channels.WritableByteChannel
+import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
@@ -49,7 +50,7 @@ object ArraySeqUtils {
       resultArray
   }
 
-  def readFromFile(fileName: String): IO[ArraySeq[Byte]] = IO{
+  def readFromFile[F[_] : Sync](fileName: String): F[ArraySeq[Byte]] = Sync[F].delay{
     ArraySeq.unsafeWrapArray(Files.readAllBytes(Paths.get(fileName)))
   }
 
@@ -334,16 +335,26 @@ object UdpClient extends Logging {
     }
   }
 
+  def unsafeUploadBytes(socket: DatagramSocket, bytes: ArraySeq[Byte], addressToSendTo: InetSocketAddress, fileUUID: UUID, fileName: BoundedString): Unit = {
+    val encodingPackets = RaptorQEncoder.encodeAsSingleBlockIterator(bytes, 10000)._2
+    val fileUploadRequest = FileUploadRequest.create(fileUUID, fileName, addressToSendTo)
+    socket.send(UdpCommon.datagramPacketFromFS2Packet(fileUploadRequest.underlyingPacket))
+    encodingPackets
+      .map(FileFragment.encode(addressToSendTo, _))
+      .map(_.underlyingPacket.|>(UdpCommon.datagramPacketFromFS2Packet))
+      .foreach(fileFragmentPacket => socket.send(fileFragmentPacket))
+  }
+
   def unsafeDownloadFile(socket: DatagramSocket): ArraySeq[Byte] = {
     val dataDecoder = OpenRQ.newDecoder(UdpCommon.defaultFECParameters, 5)
     val serverAddress = new InetSocketAddress(InetAddress.getByName("localhost"), 8012)
-    val packet = FileRequest.createFileRequest(serverAddress, new UUID(0, 0)).underlyingPacket
+    val packet = FileDownloadRequest.createFileRequest(serverAddress, new UUID(0, 0)).underlyingPacket
     val fileRequestDatagramPacket = UdpCommon.datagramPacketFromFS2Packet(packet)
     val downloadIterator = unsafeBlockingPacketIterator(socket)
       .|>(tapIterator(_)(packet => logger.debug(s"Raw datagram packet: $packet")))
       .map(UdpCommon.fs2packetFromDatagramPacket)
       .|>(tapIterator(_)(fs2Packet => logger.debug(s"Decoded FS2 packet: $fs2Packet")))
-      .map(FileResponsePacket.decode(_, dataDecoder))
+      .map(ServerResponse.decode(_, dataDecoder))
       .|>(tapIterator(_)(serverResponseOpt => logger.debug(s"After attempting to decode a packet as a response from the server: $serverResponseOpt")))
       .collect{case Some(fileFragment: FileFragment) => fileFragment}
       .|>(tapIterator(_)(serverResponse => logger.debug(s"After decoding server response: $serverResponse")))
@@ -370,10 +381,19 @@ object UdpClient extends Logging {
     blocker.blockOn(Sync[F].delay(unsafeDownloadFile(socket)))
   }
 
+  def uploadFile[F[_] : Sync : ContextShift](
+    blocker: Blocker,
+    socket: DatagramSocket,
+    bytes: ArraySeq[Byte],
+    addressToSendTo: InetSocketAddress,
+    fileUUID: UUID, fileName: BoundedString
+  ): F[Unit] = {
+    blocker.blockOn(Sync[F].delay(unsafeUploadBytes(socket, bytes, addressToSendTo, fileUUID, fileName)))
+  }
+
   def downloadFileA[F[_] : Sync : ContextShift](fileUUID: UUID): F[ArraySeq[Byte]] = {
     GlobalResources.blockerResource[F]
       .flatMap(blocker => GlobalResources.makeDatagramSocket(8011).map((_, blocker)))
-//      .flatMap(blocker => DummySocket.asResource[F](8011).map((_, blocker)))
       .use{
         case (socket, blocker) => downloadFileAA(blocker, socket)
       }
@@ -388,7 +408,7 @@ object UdpClient extends Logging {
         (socket: Socket[F]) =>
           val serverAddress = new InetSocketAddress(InetAddress.getByName("localhost"), 8012)
           val writeOutDummyPacket = socket
-            .write(FileRequest.createFileRequest(serverAddress, new UUID(0, 0)).underlyingPacket)
+            .write(FileDownloadRequest.createFileRequest(serverAddress, new UUID(0, 0)).underlyingPacket)
             .*>(Sync[F].delay(println("Sent a dummy packet!")))
           val receivePackets = socket
             .reads()
@@ -396,7 +416,7 @@ object UdpClient extends Logging {
             .evalTap{_ =>
               Sync[F].delay(println(s"Packet received")).*>(Sync[F].delay({counter = counter + 1}))
             }
-            .map(FileResponsePacket.decode(_, dataDecoder))
+            .map(ServerResponse.decode(_, dataDecoder))
             .collect{case Some(fileFragment: FileFragment) => fileFragment}
             .map(_.toEncodingPacketWithDecoder(dataDecoder))
             .evalMap(BatchRaptorQDecoder.feedSinglePacketSync[F](_, UdpCommon.defaultFECParameters, dataDecoder))
@@ -415,11 +435,14 @@ object UdpClient extends Logging {
 sealed trait RequestCode {
   def asByte: Byte
 }
-case object FileRequestCode extends RequestCode {
+case object FileDownloadRequestCode extends RequestCode {
   override def asByte: Byte = 27
 }
 case object StopRequestCode extends RequestCode {
   override def asByte: Byte = 1
+}
+case object FileUploadRequestCode extends RequestCode {
+  override def asByte: Byte = 28
 }
 
 sealed trait ClientRequest {
@@ -428,11 +451,14 @@ sealed trait ClientRequest {
 
 object ClientRequest {
   private def decodeFromPacketCanary(clientRequest: ClientRequest): Unit = clientRequest match {
-    case _: FileRequest => ()
+    case _: FileDownloadRequest => ()
     case _: StopRequest => ()
+    case _: FileUploadRequest => ()
   }
   def decodeFromPacket(udpPacket: Packet): Option[ClientRequest] =
-    FileRequest.decodeFromPacket(udpPacket).orElse(StopRequest.decodeFromPacket(udpPacket))
+    FileDownloadRequest.decodeFromPacket(udpPacket)
+      .orElse(StopRequest.decodeFromPacket(udpPacket))
+      .orElse(FileUploadRequest.decodeFromPacket(udpPacket))
 }
 
 /**
@@ -448,42 +474,154 @@ object ClientRequest {
  *
  * @param underlyingPacket
  */
-final case class FileRequest(underlyingPacket: Packet) extends ClientRequest {
+final case class FileDownloadRequest(underlyingPacket: Packet) extends ClientRequest {
   // This should be read-only!
   private def rawBytesOfPacket = underlyingPacket.bytes.toBytes.values
 
   def fileUUID: UUID = {
     val byteBuffer = java.nio.ByteBuffer.wrap(rawBytesOfPacket)
-    // Discard one byte, which just signals the byte here
-    byteBuffer.get()
-    val mostSignificantBits = byteBuffer.getLong()
-    val leastSignificantBits = byteBuffer.getLong()
+    // Ignore the first byte, which just signals what kind of packet this is
+    val mostSignificantBits = byteBuffer.getLong(1)
+    val leastSignificantBits = byteBuffer.getLong(1 + 8)
     new UUID(mostSignificantBits, leastSignificantBits)
   }
 
   def address: InetSocketAddress = underlyingPacket.remote
 
-  override def requestCode: FileRequestCode.type = FileRequestCode
+  override def requestCode: FileDownloadRequestCode.type = {
+    assert(
+      FileDownloadRequestCode.asByte == rawBytesOfPacket.head,
+      s"This is a programmer bug! We created a FileDownloadRequest around a " +
+        s"packet whose first byte does not signal a FileDownloadRequest (${FileDownloadRequestCode.asByte}) (it " +
+        s"was instead ${rawBytesOfPacket.head})"
+    )
+    FileDownloadRequestCode
+  }
 
-  override def toString: String = s"FileRequest(fileUUID: $fileUUID, address: $address)"
+  override def toString: String = s"FileDownloadRequest(fileUUID: $fileUUID, address: $address)"
 }
 
-object FileRequest {
-  def createFileRequest(remote: InetSocketAddress, fileUUID: UUID): FileRequest = {
+object FileDownloadRequest {
+  def createFileRequest(remote: InetSocketAddress, fileUUID: UUID): FileDownloadRequest = {
     val sizeOfArray = 1 + 16
     val byteBuffer = java.nio.ByteBuffer.wrap(Array.fill[Byte](sizeOfArray)(0))
-    byteBuffer.put(FileRequestCode.asByte)
+    byteBuffer.put(FileDownloadRequestCode.asByte)
     byteBuffer.putLong(fileUUID.getMostSignificantBits)
     byteBuffer.putLong(fileUUID.getLeastSignificantBits)
     val packet = Packet(remote, Chunk.bytes(byteBuffer.array()))
-    FileRequest(packet)
+    FileDownloadRequest(packet)
   }
 
   // FIXME: Add additional checks (UUID validity)
-  def decodeFromPacket(udpPacket: Packet): Option[FileRequest] = for {
+  def decodeFromPacket(udpPacket: Packet): Option[FileDownloadRequest] = for {
     firstByte <- udpPacket.bytes.head
-    result <- if (firstByte == FileRequestCode.asByte) Some(FileRequest(udpPacket)) else None
+    result <- if (firstByte == FileDownloadRequestCode.asByte) Some(FileDownloadRequest(udpPacket)) else None
   } yield result
+}
+
+sealed abstract case class BoundedString private (underlyingString: String) {
+  def toBytes: ArraySeq[Byte] = ArraySeq.unsafeWrapArray(underlyingString.getBytes(StandardCharsets.UTF_8))
+
+  def lengthAsUnsignedByte: Byte = (toBytes.length - 127).asInstanceOf[Byte]
+}
+
+object BoundedString {
+  val MaxSizeInBytes: Int = 256
+
+  def fromString(str: String): Option[BoundedString] =
+    if (str.getBytes(StandardCharsets.UTF_8).length <= MaxSizeInBytes) {
+      Some(new BoundedString(str) {})
+    } else {
+      None
+    }
+
+  def unsafeDecodeFromBytes(bytes: ArraySeq[Byte]): BoundedString = {
+    decodeFromBytes(bytes)
+      .getOrElse(throw new Exception(
+        s"Programmer Error! In order to use this method you must be sure that " +
+          s"the size of the bytes passed in (${bytes.length}) is less than $MaxSizeInBytes"
+      ))
+  }
+
+  def decodeFromBytes(bytes: ArraySeq[Byte]): Option[BoundedString] =
+    if (bytes.length <= MaxSizeInBytes) {
+      val string = new String(ArraySeqUtils.unsafeToByteArray(bytes), StandardCharsets.UTF_8)
+      Some(new BoundedString(string) {})
+    } else {
+      None
+    }
+}
+
+final case class FileUploadRequest(underlyingPacket: Packet) extends ClientRequest {
+  // This should be read-only!
+  private def rawBytesOfPacket = underlyingPacket.bytes.toBytes.values
+
+  def fileUUID: UUID = {
+    val byteBuffer = java.nio.ByteBuffer.wrap(rawBytesOfPacket)
+    // Ignore the first byte, which just signals what kind of packet this is
+    val mostSignificantBits = byteBuffer.getLong(1)
+    val leastSignificantBits = byteBuffer.getLong(1 + 8)
+    new UUID(mostSignificantBits, leastSignificantBits)
+  }
+
+  def fileName: BoundedString = {
+    // Ignore the first byte, which just signals what kind of packet this is
+    // Also ignore the UUID bytes
+    val indexOfFileNameSize = 1 + 16
+    // We treat the size byte as an unsigned byte
+    val sizeOfFileName = java.lang.Byte.toUnsignedInt(rawBytesOfPacket(indexOfFileNameSize))
+    val indexOfFirstByteOfFileName = indexOfFileNameSize + 1
+    val resultingBytes = Array.fill[Byte](sizeOfFileName)(0)
+    Array.copy(rawBytesOfPacket, indexOfFirstByteOfFileName, resultingBytes, 0, sizeOfFileName)
+    BoundedString.unsafeDecodeFromBytes(ArraySeq.unsafeWrapArray(resultingBytes))
+  }
+
+  override def requestCode: FileUploadRequestCode.type = {
+    assert(
+      FileUploadRequestCode.asByte == rawBytesOfPacket.head,
+      s"This is a programmer bug! We created a FileUploadRequest around a " +
+        s"packet whose first byte does not signal a FileUploadRequest (${FileUploadRequestCode.asByte}) (it " +
+        s"was instead ${rawBytesOfPacket.head})"
+    )
+    FileUploadRequestCode
+  }
+}
+
+object FileUploadRequest {
+  def create(fileUUID: UUID, fileName: BoundedString, address: InetSocketAddress): FileUploadRequest = {
+    val size = 16 + 1 + fileName.toBytes.length
+    val rawBytes = Array.fill[Byte](size)(0)
+    val byteBuffer = ByteBuffer.wrap(rawBytes)
+    byteBuffer.put(FileUploadRequestCode.asByte)
+    byteBuffer.putLong(fileUUID.getMostSignificantBits)
+    byteBuffer.putLong(fileUUID.getLeastSignificantBits)
+    byteBuffer.put(fileName.lengthAsUnsignedByte)
+    byteBuffer.put(ArraySeqUtils.unsafeToByteArray(fileName.toBytes))
+    val chunk = Chunk.bytes(byteBuffer.array())
+    FileUploadRequest(Packet(address, chunk))
+  }
+
+  def decodeFromPacket(udpPacket: Packet): Option[FileUploadRequest] = {
+    // first identifying byte + 16 bytes for a UUID + 1 byte indicating size of filename
+    val minimumExpectedSize = 1 + 16 + 1
+    val indexOfFileNameSizeByte = minimumExpectedSize - 1
+    val sizeExceedsMinimum = udpPacket.bytes.size >= minimumExpectedSize
+    val isFirstByteUploadRequestOpt =
+      udpPacket.bytes.head.map(firstByte => firstByte == FileUploadRequestCode.asByte)
+    val totalExpectedSizeOpt = if (sizeExceedsMinimum) {
+      // Unsafe get on the Option is okay because we've checked our length exceeds the index
+      // We're treating the byte as unsigned because filesize is a natural number
+      val fileNameSize = java.lang.Byte.toUnsignedInt(udpPacket.bytes.get(indexOfFileNameSizeByte).get)
+      Some(minimumExpectedSize + fileNameSize)
+    } else {
+      None
+    }
+    for {
+      isFirstByteUploadRequest <- isFirstByteUploadRequestOpt
+      totalExpectedSize <- totalExpectedSizeOpt
+      _ <- if (isFirstByteUploadRequest && udpPacket.bytes.size == totalExpectedSize) Some(()) else None
+    } yield FileUploadRequest(udpPacket)
+  }
 }
 
 final case class StopRequest(underlyingPacket: Packet) extends ClientRequest {
@@ -494,8 +632,8 @@ final case class StopRequest(underlyingPacket: Packet) extends ClientRequest {
     val byteBuffer = java.nio.ByteBuffer.wrap(rawBytesOfPacket)
     // Ignore the first byte
     byteBuffer.get()
-    val mostSignificantBits = byteBuffer.getLong()
-    val leastSignificantBits = byteBuffer.getLong()
+    val mostSignificantBits = byteBuffer.getLong(1)
+    val leastSignificantBits = byteBuffer.getLong(1 + 8)
     new UUID(mostSignificantBits, leastSignificantBits)
   }
 
@@ -520,27 +658,30 @@ object StopRequest {
   }
 }
 
-sealed trait ResponseStatus {
+sealed trait ResponseType {
   def asByte: Byte
 }
-case object SuccessfulFileResponseFragmentStatus extends ResponseStatus {
+case object SuccessfulFileResponseFragmentType extends ResponseType {
   override def asByte: Byte = 0
 }
-case object FileUUIDNotFoundStatus extends ResponseStatus {
+case object FileUUIDNotFoundType extends ResponseType {
   override def asByte: Byte =  1
 }
+case object ReceivedUploadRequestType extends ResponseType {
+  override def asByte: Byte = 2
+}
 
-object ResponseStatus {
+object ResponseType {
   // If you see a warning about an uncovered case here, you need to add that case to addByte
-  private def fromByteCanary(responseStatus: ResponseStatus): Unit = responseStatus match {
-    case SuccessfulFileResponseFragmentStatus => ()
-    case FileUUIDNotFoundStatus => ()
+  private def fromByteCanary(responseStatus: ResponseType): Unit = responseStatus match {
+    case SuccessfulFileResponseFragmentType => ()
+    case FileUUIDNotFoundType => ()
   }
-  def fromByte(byte: Byte): Option[ResponseStatus] = {
-    if (byte == SuccessfulFileResponseFragmentStatus.asByte) {
-      Some(SuccessfulFileResponseFragmentStatus)
-    } else if (byte == FileUUIDNotFoundStatus.asByte) {
-      Some(FileUUIDNotFoundStatus)
+  def fromByte(byte: Byte): Option[ResponseType] = {
+    if (byte == SuccessfulFileResponseFragmentType.asByte) {
+      Some(SuccessfulFileResponseFragmentType)
+    } else if (byte == FileUUIDNotFoundType.asByte) {
+      Some(FileUUIDNotFoundType)
     } else {
       None
     }
@@ -548,9 +689,9 @@ object ResponseStatus {
 }
 
 // These packets all
-sealed trait FileResponsePacket
+sealed trait ServerResponse
 
-final case class FileFragment(underlyingPacket: Packet) extends FileResponsePacket {
+final case class FileFragment(underlyingPacket: Packet) extends ServerResponse {
   def toEncodingPacketWithDecoder(dataDecoder: DataDecoder): EncodingPacket = {
     EncodingPacket.parsePacket(dataDecoder, underlyingPacket.bytes.toBytes.values, false).value()
   }
@@ -565,13 +706,13 @@ object FileFragment {
   }
 }
 
-final case class FileUUIDNotFound(underlyingPacket: Packet) extends FileResponsePacket
+final case class FileUUIDNotFound(underlyingPacket: Packet) extends ServerResponse
 object FileUUIDNotFound extends Logging {
   def encode(inetSocketAddress: InetSocketAddress, uuid: UUID): FileUUIDNotFound = {
     try {
       val lengthOfArray = 1 + 16 // One byte for the initial response and then 4 for the UUID
       val rawBytes = Array.fill[Byte](lengthOfArray)(0)
-      rawBytes(0) = FileUUIDNotFoundStatus.asByte
+      rawBytes(0) = FileUUIDNotFoundType.asByte
       val byteBuffer = ByteBuffer.wrap(rawBytes, 1, 16)
       byteBuffer.putLong(uuid.getMostSignificantBits)
       byteBuffer.putLong(uuid.getLeastSignificantBits)
@@ -585,24 +726,44 @@ object FileUUIDNotFound extends Logging {
   }
 }
 
-object FileResponsePacket {
-  def decode(udpPacket: Packet, dataDecoder: DataDecoder): Option[FileResponsePacket] = {
+final case class ReceivedUploadRequest(underlyingPacket: Packet) extends ServerResponse
+object ReceivedUploadRequest extends Logging {
+  def encode(inetSocketAddress: InetSocketAddress, fileUUID: UUID): ReceivedUploadRequest = {
+    try {
+      val lengthOfArray = 1 + 16 // One byte for the initial response and then 4 for the UUID
+      val rawBytes = Array.fill[Byte](lengthOfArray)(0)
+      rawBytes(0) = ReceivedUploadRequestType.asByte
+      val byteBuffer = ByteBuffer.wrap(rawBytes, 1, 16)
+      byteBuffer.putLong(fileUUID.getMostSignificantBits)
+      byteBuffer.putLong(fileUUID.getLeastSignificantBits)
+      ReceivedUploadRequest(Packet(inetSocketAddress, Chunk.bytes(byteBuffer.array())))
+    } catch {
+      case exception: Exception =>
+        // FIXME: Need to figure out why this error isn't actually being thrown further up
+        logger.error(exception)
+        throw exception
+    }
+  }
+}
+
+object ServerResponse {
+  def decode(udpPacket: Packet, dataDecoder: DataDecoder): Option[ServerResponse] = {
     if (udpPacket.bytes.size > 1000) {
       Some(FileFragment(udpPacket))
     } else {
-      ResponseStatus.fromByte(udpPacket.bytes(0)).map{
-        case SuccessfulFileResponseFragmentStatus => FileFragment(udpPacket)
-        case FileUUIDNotFoundStatus => FileUUIDNotFound(udpPacket)
+      ResponseType.fromByte(udpPacket.bytes(0)).map{
+        case SuccessfulFileResponseFragmentType => FileFragment(udpPacket)
+        case FileUUIDNotFoundType => FileUUIDNotFound(udpPacket)
       }
     }
   }
 
-  def lookupStatus(fileResponsePacket: FileResponsePacket): ResponseStatus = fileResponsePacket match {
-    case _: FileFragment => SuccessfulFileResponseFragmentStatus
-    case _: FileUUIDNotFound => FileUUIDNotFoundStatus
+  def lookupStatus(fileResponsePacket: ServerResponse): ResponseType = fileResponsePacket match {
+    case _: FileFragment => SuccessfulFileResponseFragmentType
+    case _: FileUUIDNotFound => FileUUIDNotFoundType
   }
 
-  def encode(fileResponsePacket: FileResponsePacket): Packet = fileResponsePacket match {
+  def encode(fileResponsePacket: ServerResponse): Packet = fileResponsePacket match {
     case FileFragment(underlyingPacket) => underlyingPacket
     case FileUUIDNotFound(underlyingPacket) => underlyingPacket
   }
@@ -665,40 +826,63 @@ object UniqueQueue {
 }
 
 final case class ServerState(
-  currentRequestsBeingProcessed: Set[FileRequest],
-  filesWaitingTransfer: UniqueQueue[FileRequest]
+  currentClientDownloadRequestsBeingProcessed: Set[FileDownloadRequest],
+  currentClientUploadRequestsBeingProcessed: Set[FileUploadRequest],
+  filesWaitingTransferToClients: UniqueQueue[FileDownloadRequest],
+  filesWaitingTransferFromClients: UniqueQueue[FileUploadRequest],
+  mappingOfUUIDsToFiles: Map[UUID, Path]
 ) {
   def abbreviatedToString: String =
-    s"ServerState(currentRequestsBeingProcessed: ${currentRequestsBeingProcessed.size} elements, filesWaitingTransfer: ${filesWaitingTransfer.size} elements)"
+    s"ServerState(currentRequestsBeingProcessed: ${currentClientDownloadRequestsBeingProcessed.size} elements, filesWaitingTransfer: ${filesWaitingTransferToClients.size} elements)"
 
-  def markBeingProcessed: Option[(FileRequest, ServerState)] = {
-    filesWaitingTransfer.dequeueOption.map{
+  def markTransferFromClientBeingProcessed: Option[(FileUploadRequest, ServerState)] = {
+    filesWaitingTransferFromClients.dequeueOption.map{
       case (requestToProcess, newQueue) =>
-        val newState = ServerState(currentRequestsBeingProcessed + requestToProcess, newQueue)
+        val newState = this.copy(
+          currentClientUploadRequestsBeingProcessed = currentClientUploadRequestsBeingProcessed + requestToProcess,
+          filesWaitingTransferFromClients = newQueue,
+          mappingOfUUIDsToFiles = mappingOfUUIDsToFiles + (requestToProcess.fileUUID -> Paths.get(requestToProcess.fileUUID.toString))
+        )
+        (requestToProcess, newState)
+    }
+  }
+
+  def markTransferToClientBeingProcessed: Option[(FileDownloadRequest, ServerState)] = {
+    filesWaitingTransferToClients.dequeueOption.map{
+      case (requestToProcess, newQueue) =>
+        val newState = this.copy(
+          currentClientDownloadRequestsBeingProcessed = currentClientDownloadRequestsBeingProcessed + requestToProcess,
+          filesWaitingTransferToClients = newQueue
+        )
         (requestToProcess, newState)
     }
   }
 
   def markClientRequestReceived(request: ClientRequest): ServerState = request match {
-    case fileRequest: FileRequest => markFileRequestReceived(fileRequest)
+    case fileRequest: FileDownloadRequest => markFileRequestReceived(fileRequest)
     case cancellationRequest: StopRequest => markCancellationRequestReceived(cancellationRequest)
+    case uploadRequest: FileUploadRequest => markFileUploadRequestReceived(uploadRequest)
   }
 
-  def markFileRequestReceived(request: FileRequest): ServerState = {
-    this.copy(filesWaitingTransfer = filesWaitingTransfer.enqueue(request))
+  def markFileRequestReceived(request: FileDownloadRequest): ServerState = {
+    this.copy(filesWaitingTransferToClients = filesWaitingTransferToClients.enqueue(request))
   }
 
   def markCancellationRequestReceived(requestToCancel: StopRequest): ServerState = {
-    val correspondingFileRequest = FileRequest.createFileRequest(
+    val correspondingFileRequest = FileDownloadRequest.createFileRequest(
       requestToCancel.underlyingPacket.remote,
       requestToCancel.getFileUUID
     )
-    this.copy(currentRequestsBeingProcessed = currentRequestsBeingProcessed - correspondingFileRequest)
+    this.copy(currentClientDownloadRequestsBeingProcessed = currentClientDownloadRequestsBeingProcessed - correspondingFileRequest)
+  }
+
+  def markFileUploadRequestReceived(fileUploadRequest: FileUploadRequest): ServerState = {
+    this.copy(filesWaitingTransferFromClients = filesWaitingTransferFromClients.enqueue(fileUploadRequest))
   }
 }
 
 object ServerState {
-  def empty: ServerState = ServerState(Set.empty, UniqueQueue.empty)
+  def empty: ServerState = ServerState(Set.empty, Set.empty, UniqueQueue.empty, UniqueQueue.empty)
 }
 
 object UdpServer extends Logging {
@@ -724,7 +908,7 @@ object UdpServer extends Logging {
       .traverse_(udpPacket => Sync[F].delay(println(s"Writing out this UDP packet: $udpPacket"))*>(socket.write(udpPacket, Some(FiniteDuration(1, TimeUnit.SECONDS)))))
   }
 
-  def respondToRequest[F[_] : Sync](request: FileRequest): fs2.Stream[F, FileResponsePacket] = {
+  def respondToRequest[F[_] : Sync](request: FileDownloadRequest): fs2.Stream[F, ServerResponse] = {
     val requestAddress = request.underlyingPacket.remote
     UdpCommon.uuidToFileName.get(request.fileUUID) match {
       case None => fs2.Stream(FileUUIDNotFound.encode(requestAddress, request.fileUUID))
@@ -737,10 +921,13 @@ object UdpServer extends Logging {
     }
   }
 
-  val serverState: AtomicReference[ServerState] =
-    new AtomicReference[ServerState](ServerState(Set.empty, UniqueQueue.empty[FileRequest]))
+  val serverState: AtomicReference[ServerState] = new AtomicReference[ServerState](ServerState.empty)
 
-  def transferFile(request: FileRequest): Iterator[FileResponsePacket] = {
+  def acknowledgeUploadRequest(request: FileUploadRequest): Unit = {
+    ???
+  }
+
+  def transferFile(request: FileDownloadRequest): Iterator[ServerResponse] = {
     logger.info(s"REQUEST: $request")
     val requestAddress = request.address
     val result = UdpCommon.uuidToFileName.get(request.fileUUID) match {
@@ -754,16 +941,43 @@ object UdpServer extends Logging {
     result
   }
 
-  def unsafeProcessResponsePacket(fileResponsePacket: FileResponsePacket, datagramSocket: DatagramSocket): Unit = {
-    val packet = FileResponsePacket.encode(fileResponsePacket)
+  def unsafeProcessResponsePacket(fileResponsePacket: ServerResponse, datagramSocket: DatagramSocket): Unit = {
+    val packet = ServerResponse.encode(fileResponsePacket)
     val datagramPacket = UdpCommon.datagramPacketFromFS2Packet(packet)
     datagramSocket.send(datagramPacket)
     logger.debug("Sent file response packet")
   }
 
+  def unsafeProcessOneTransferFromClientInServerState(serverState: AtomicReference[ServerState], datagramSocket: DatagramSocket): Unit = {
+    logger.info("Received prompt to analyze server state once: process transfer from ")
+    UdpCommon.updateAndGetMoreInfo(serverState)(_.markTransferFromClientBeingProcessed) match {
+      case Right((uploadFileRequest, _)) =>
+        logger.info("Updated state successfully")
+        val iterator = transferFile(uploadFileRequest)
+        logger.info("Created iterator!")
+        var i = 0
+        Breaks.breakable{
+          iterator.foreach{packet =>
+            unsafeProcessResponsePacket(packet, datagramSocket)
+            if (i % 100 == 0) {
+              val stillShouldProcess = serverState.get().currentClientDownloadRequestsBeingProcessed.contains(uploadFileRequest)
+              if (!stillShouldProcess) {
+                Breaks.break()
+              }
+              logger.debug(s"WE'VE processed: $i")
+            }
+            i += 1
+          }
+        }
+      case Left(x) =>
+        logger.info(s"No outstanding requests so not doing anything...: $x")
+        ()
+    }
+  }
+
   def unsafeProcessOneElementOfServerState(serverState: AtomicReference[ServerState], datagramSocket: DatagramSocket): Unit = {
     logger.info("Received prompt to analyze server state once")
-    UdpCommon.updateAndGetMoreInfo(serverState)(_.markBeingProcessed) match {
+    UdpCommon.updateAndGetMoreInfo(serverState)(_.markTransferToClientBeingProcessed) match {
       case Right((fileRequest, _)) =>
         logger.info("Updated state successfully")
         val iterator = transferFile(fileRequest)
@@ -773,7 +987,7 @@ object UdpServer extends Logging {
           iterator.foreach{packet =>
             unsafeProcessResponsePacket(packet, datagramSocket)
             if (i % 100 == 0) {
-              val stillShouldProcess = serverState.get().currentRequestsBeingProcessed.contains(fileRequest)
+              val stillShouldProcess = serverState.get().currentClientDownloadRequestsBeingProcessed.contains(fileRequest)
               if (!stillShouldProcess) {
                 Breaks.break()
               }
@@ -817,50 +1031,6 @@ object UdpServer extends Logging {
     blocker.blockOn(Sync[F].delay(unsafeBlockingDealWithSocketOnce(socket, serverState)))
   }
 
-  def fullResponse[F[_] : Concurrent](incomingPackets: fs2.Stream[F, Packet]): fs2.Stream[F, FileResponsePacket] = {
-    for {
-      fileRequestQueue <- fs2.Stream.eval(fs2.concurrent.Queue.bounded[F, FileRequest](10))
-      stopQueue <- fs2.Stream.eval(fs2.concurrent.Topic(StopRequest.createStopRequest(new InetSocketAddress(InetAddress.getLocalHost, 80), new UUID(0, 0))))
-      result <- fileRequestQueue
-        .dequeue
-        .concurrently(stopQueue.subscribers.evalTap(numOfSubscribers => Sync[F].delay(println(s"NUM OF SUBSCRIBERS: $numOfSubscribers"))))
-        .map{request =>
-          val stopSignal = stopQueue
-            .subscribe(10)
-            .map{stopRequest =>
-              println(s"STOP REQUEST UUID: ${stopRequest.getFileUUID}")
-              println(s"REQUEST UUID: ${request.fileUUID}")
-              val fileUUIDsAgree = stopRequest.getFileUUID == request.fileUUID
-              println(s"STOP REQUEST address: ${stopRequest.underlyingPacket.remote}")
-              println(s"REQUEST address: ${request.underlyingPacket.remote}")
-              val addressesAgree = stopRequest.underlyingPacket.remote == request.underlyingPacket.remote
-              fileUUIDsAgree && addressesAgree
-            }
-            .evalTap(stopSignal => Sync[F].delay(println(s"Stop signal is $stopSignal")))
-            .takeWhile(x => !x, false)
-            .append(fs2.Stream.eval(Sync[F].delay(println("Stop signal is shutting down..."))).drain)
-          respondToRequest[F](request)
-            .interruptWhen(stopSignal)
-            .append(fs2.Stream.eval(Sync[F].delay(println("Stream is shutting down..."))).drain)
-        }
-        .parJoin(5)
-        .concurrently{
-          incomingPackets
-            .evalTap(packet => Sync[F].delay(println(s"SERVER RECEIVED: $packet")))
-            .map(ClientRequest.decodeFromPacket)
-            .collect{case Some(x) => x}
-            .evalMap{
-              case request: FileRequest =>
-                println(s"This was a file request: $request")
-                fileRequestQueue.enqueue1(request)
-              case request: StopRequest =>
-                println(s"This was a stop request: $request")
-                stopQueue.publish1(request)
-            }
-        }
-    } yield result
-  }
-
   def respondToIncomingPacket[F[_] : Sync](udpPacket: Packet, socket: Socket[F]): F[Unit] = {
     for {
       _ <- Sync[F].delay(println(s"Received a packet: $udpPacket"))
@@ -884,7 +1054,6 @@ object UdpServer extends Logging {
   def fullRun[F[_] : Concurrent: ContextShift]: F[Unit] = {
     GlobalResources.blockerResource[F]
       .flatMap(blocker => GlobalResources.makeDatagramSocket[F](8012).map(socket => (blocker, socket)))
-//      .flatMap(blocker => DummySocket.asResource[F](8012).map(socket => (blocker, socket)))
       .use{
         case (blocker, socket) =>
           val listeningToSocketStream = fs2.Stream.repeatEval(dealWithSocketOnce(blocker, socket, UdpServer.serverState))
@@ -1001,7 +1170,7 @@ object Main extends IOApp {
     val result = BatchRaptorQDecoder.batchDecode(loseALotOfEncodedBytes.take(1000).toList, fecParameters)
     println(s"Hello world!: $result")
 
-    val action = if (args(1) == "client") {
+    val action = if (args(1) == "download") {
       UdpClient.downloadFileA[IO](new UUID(0, 0)).map(_ => ())
     } else if (args(1) == "server") {
       UdpServer.fullRun[IO]
@@ -1013,10 +1182,23 @@ object Main extends IOApp {
         _ <- serverFiber.join
         _ <- clientFiber.join
       } yield ()
+    } else if (args(1) == "upload") {
+      val fileNameOnDisk = args(2)
+      // FIXME
+      val fileName = BoundedString.fromString(fileNameOnDisk).get
+      GlobalResources.blockerResource[IO]
+        .flatMap(blocker => GlobalResources.makeDatagramSocket[IO](8011).map((_, blocker)))
+        .use{
+          case (socket, blocker) =>
+            for {
+              fileBytes <- ArraySeqUtils.readFromFile[IO](fileNameOnDisk)
+              _ <- UdpClient.uploadFile[IO](blocker, socket, fileBytes, new InetSocketAddress(8012), new UUID(1L, 1L), fileName)
+            } yield ()
+        }
     } else {
       IO{
         Thread.sleep(20000)
-        val myBytes = ArraySeqUtils.readFromFile("Track 10.wav").unsafeRunSync()
+        val myBytes = ArraySeqUtils.readFromFile[IO]("Track 10.wav").unsafeRunSync()
         val (fecParameters, encodedBytes) = RaptorQEncoder.encodeUnordered[IO](myBytes, 10000, 20)
         val loseALotOfEncodedBytes = encodedBytes.dropWhile(packet => packet.encodingSymbolID() % 2 == 0).take(100000)
         val loseALotOfEncodedBytesForced = loseALotOfEncodedBytes.take(myBytes.length + 200).compile.drain.unsafeRunSync()
