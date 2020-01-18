@@ -8,7 +8,7 @@ import java.nio.channels.WritableByteChannel
 import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
-import java.util.concurrent.{Callable, ConcurrentLinkedQueue, ExecutorService, Executors, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.{Callable, ConcurrentHashMap, ConcurrentLinkedQueue, ExecutorService, Executors, LinkedBlockingQueue, TimeUnit}
 
 import cats.{Applicative, Monad}
 import cats.effect.{Blocker, Concurrent, ContextShift, ExitCode, IO, IOApp, Resource, Sync}
@@ -19,6 +19,7 @@ import net.fec.openrq.decoder.DataDecoder
 import net.fec.openrq.parameters.{FECParameters, ParameterChecker}
 import net.fec.openrq.{EncodingPacket, OpenRQ, SerializablePacket, SymbolType}
 
+import scala.annotation.tailrec
 import scala.collection.immutable.{ArraySeq, Queue, SortedSet}
 import scala.collection.immutable.ArraySeq.ofByte
 import scala.collection.mutable
@@ -449,7 +450,7 @@ final case class FileRequest(underlyingPacket: Packet) extends ClientRequest {
   // This should be read-only!
   private def rawBytesOfPacket = underlyingPacket.bytes.toBytes.values
 
-  def getFileUUID: UUID = {
+  def fileUUID: UUID = {
     val byteBuffer = java.nio.ByteBuffer.wrap(rawBytesOfPacket)
     // Discard one byte, which just signals the byte here
     byteBuffer.get()
@@ -458,7 +459,11 @@ final case class FileRequest(underlyingPacket: Packet) extends ClientRequest {
     new UUID(mostSignificantBits, leastSignificantBits)
   }
 
+  def address: InetSocketAddress = underlyingPacket.remote
+
   override def requestCode: FileRequestCode.type = FileRequestCode
+
+  override def toString: String = s"FileRequest(fileUUID: $fileUUID, address: $address)"
 }
 
 object FileRequest {
@@ -725,8 +730,8 @@ object UdpServer {
 
   def respondToRequest[F[_] : Sync](request: FileRequest): fs2.Stream[F, FileResponsePacket] = {
     val requestAddress = request.underlyingPacket.remote
-    UdpCommon.uuidToFileName.get(request.getFileUUID) match {
-      case None => fs2.Stream(FileUUIDNotFound.encode(requestAddress, request.getFileUUID))
+    UdpCommon.uuidToFileName.get(request.fileUUID) match {
+      case None => fs2.Stream(FileUUIDNotFound.encode(requestAddress, request.fileUUID))
       case Some(path) =>
         for {
           // FIXME need to account for lack of path
@@ -740,14 +745,14 @@ object UdpServer {
     new AtomicReference[ServerState](ServerState(Set.empty, UniqueQueue.empty[FileRequest]))
 
   def transferFile(request: FileRequest): Iterator[FileResponsePacket] = {
-    println(s"REQUEST: ${request.getFileUUID}")
+    println(s"REQUEST: $request")
     println("HELLOA")
-    val requestAddress = request.underlyingPacket.remote
+    val requestAddress = request.address
     println("HELLOB")
-    val result = UdpCommon.uuidToFileName.get(request.getFileUUID) match {
+    val result = UdpCommon.uuidToFileName.get(request.fileUUID) match {
       case None =>
         println("HELLOC")
-        Iterator.single(FileUUIDNotFound.encode(requestAddress, request.getFileUUID))
+        Iterator.single(FileUUIDNotFound.encode(requestAddress, request.fileUUID))
       case Some(path) =>
         println("HELLOD")
         val bytes = ArraySeqUtils.unsafeReadFromPath(path)
@@ -836,8 +841,8 @@ object UdpServer {
             .subscribe(10)
             .map{stopRequest =>
               println(s"STOP REQUEST UUID: ${stopRequest.getFileUUID}")
-              println(s"REQUEST UUID: ${request.getFileUUID}")
-              val fileUUIDsAgree = stopRequest.getFileUUID == request.getFileUUID
+              println(s"REQUEST UUID: ${request.fileUUID}")
+              val fileUUIDsAgree = stopRequest.getFileUUID == request.fileUUID
               println(s"STOP REQUEST address: ${stopRequest.underlyingPacket.remote}")
               println(s"REQUEST address: ${request.underlyingPacket.remote}")
               val addressesAgree = stopRequest.underlyingPacket.remote == request.underlyingPacket.remote
@@ -913,7 +918,7 @@ object UdpServer {
   }
 }
 
-class DummySocket(val port: Int) extends DatagramSocket {
+final class DummySocket(val port: Int) extends DatagramSocket {
 
   private def copyDatagramPacket(packet: DatagramPacket): DatagramPacket = {
     val newBackingArray = Array.fill[Byte](packet.getLength)(0)
@@ -924,49 +929,70 @@ class DummySocket(val port: Int) extends DatagramSocket {
   }
 
   override def send(p: DatagramPacket): Unit = {
-    println("Sending packet...")
-    if (p.getSocketAddress.asInstanceOf[InetSocketAddress].getPort == 8011) {
-      DummySocket.listOfPackets0.put(copyDatagramPacket(p))
-    } else if (p.getSocketAddress.asInstanceOf[InetSocketAddress].getPort == 8012) {
-      DummySocket.listOfPackets1.put(copyDatagramPacket(p))
-    } else {
-      ???
-    }
+    // FIXME deal with this cast
+    val packetPort = p.getSocketAddress.asInstanceOf[InetSocketAddress].getPort
+//    println("Sending packet...")
+    val packetCopy = copyDatagramPacket(p)
+    // We want to mark where this packet came from
+    packetCopy.setPort(port)
+    DummySocket.udpChannels.compute(
+      UdpPort(packetPort), (_, queue) => {
+        if (queue == null) {
+          Queue(packetCopy)
+        } else {
+          queue.enqueue(packetCopy)
+        }
+      }
+    )
   }
 
+  @tailrec
   override def receive(p: DatagramPacket): Unit = {
-    val packet = if (port == 8011) {
-      DummySocket.listOfPackets0.take()
-    } else if (port == 8012) {
-      DummySocket.listOfPackets1.take()
-    } else {
-      ???
-    }
-    println("Receiving packet...")
-    p.setSocketAddress(packet.getSocketAddress)
-    val backingArrayOfRecipient = p.getData
-    p.setLength(packet.getLength)
-    var i = 0
-    val backingPacketArray = packet.getData
-    while (i < packet.getLength) {
-      val currentWriteIndex = p.getOffset + i
-      backingArrayOfRecipient(currentWriteIndex) = backingPacketArray(i)
-      i += 1
+//    println("Receiving packet...")
+    // Yay Java APIs for maximum ugliness!
+    var element: Option[DatagramPacket] = None
+    DummySocket.udpChannels.compute(
+      UdpPort(port), (_, queue) => {
+        if (queue == null) {
+          Queue.empty[DatagramPacket]
+        } else {
+          queue.dequeueOption.map {
+            case (packet, oldQueue) =>
+              element = Some(packet)
+              oldQueue
+          }.getOrElse(Queue.empty[DatagramPacket])
+        }
+      }
+    )
+    element match {
+      case Some(packet) =>
+        p.setSocketAddress(packet.getSocketAddress)
+        val backingArrayOfRecipient = p.getData
+        p.setLength(packet.getLength)
+        var i = 0
+        val backingPacketArray = packet.getData
+        while (i < packet.getLength) {
+          val currentWriteIndex = p.getOffset + i
+          backingArrayOfRecipient(currentWriteIndex) = backingPacketArray(i)
+          i += 1
+        }
+      case None =>
+        // So we don't eat CPU like a mad man
+        Thread.sleep(5)
+        receive(p)
     }
   }
 
   override def close(): Unit = {
-    super.close()
-    if (port == 8011) {
-      DummySocket.listOfPackets0.clear()
-    } else if (port == 8012) {
-      DummySocket.listOfPackets1.clear()
-    }
   }
 
 }
 
+final case class UdpPort(toInt: Int) extends AnyVal
+
 object DummySocket {
+
+  val udpChannels: ConcurrentHashMap[UdpPort, Queue[DatagramPacket]] = new ConcurrentHashMap()
 
   val listOfPackets0: LinkedBlockingQueue[DatagramPacket] = new LinkedBlockingQueue[DatagramPacket]()
   val listOfPackets1: LinkedBlockingQueue[DatagramPacket] = new LinkedBlockingQueue[DatagramPacket]()
