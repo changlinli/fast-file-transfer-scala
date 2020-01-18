@@ -49,22 +49,22 @@ class TestRaptorCode extends AnyFlatSpec with Matchers {
     val (fecParameters0, stream) = RaptorQEncoder.encodeAsSingleBlockStream[IO](myBytes, 10000)
     val topLevelDecoder0 = OpenRQ.newDecoder(fecParameters0, 5)
     val beginningTimeIO = System.currentTimeMillis()
-    GlobalResources.socketResourceLocalhost[IO](8012).use{
-      socket =>
-        val inputStream = stream
-          .map(encodingPacket => Packet(new InetSocketAddress(InetAddress.getLocalHost, 8012), Chunk.bytes(encodingPacket.asArray()))).take(4000)
-          .through(socket.writes())
-        val outputStream = socket
-          .reads()
-          .map(packet => topLevelDecoder.parsePacket(packet.bytes.toBytes.values, false).value())
-          .evalMap(BatchRaptorQDecoder.feedSinglePacketSync[IO](_, fecParameters0, topLevelDecoder0))
-          .takeWhile(isDecoded => !isDecoded)
-        outputStream
-          .concurrently(inputStream)
-          .compile
-          .drain
-    }
-      .unsafeRunSync()
+//    GlobalResources.socketResourceLocalhost[IO](8012).use{
+//      socket =>
+//        val inputStream = stream
+//          .map(encodingPacket => Packet(new InetSocketAddress(InetAddress.getLocalHost, 8012), Chunk.bytes(encodingPacket.asArray()))).take(4000)
+//          .through(socket.writes())
+//        val outputStream = socket
+//          .reads()
+//          .map(packet => topLevelDecoder.parsePacket(packet.bytes.toBytes.values, false).value())
+//          .evalMap(BatchRaptorQDecoder.feedSinglePacketSync[IO](_, fecParameters0, topLevelDecoder0))
+//          .takeWhile(isDecoded => !isDecoded)
+//        outputStream
+//          .concurrently(inputStream)
+//          .compile
+//          .drain
+//    }
+//      .unsafeRunSync()
 //    stream
 //      .evalMap(BatchRaptorQDecoder.feedSinglePacketSync[IO](_, fecParameters0, topLevelDecoder0))
 //      .takeWhile(isDecoded => !isDecoded)

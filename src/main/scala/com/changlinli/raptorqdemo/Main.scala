@@ -8,9 +8,9 @@ import java.nio.channels.WritableByteChannel
 import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
-import java.util.concurrent.{Callable, ExecutorService, Executors, TimeUnit}
+import java.util.concurrent.{Callable, ConcurrentLinkedQueue, ExecutorService, Executors, LinkedBlockingQueue, TimeUnit}
 
-import cats.Monad
+import cats.{Applicative, Monad}
 import cats.effect.{Blocker, Concurrent, ContextShift, ExitCode, IO, IOApp, Resource, Sync}
 import cats.implicits._
 import fs2.Chunk
@@ -269,8 +269,13 @@ object GlobalResources {
   def makeDatagramSocket[F[_] : Sync](port: Int): Resource[F, DatagramSocket] = {
     Resource.make{
       Sync[F].delay{
-        val socket = new DatagramSocket(port)
-        socket
+        try {
+          val socket = new DatagramSocket(port)
+          socket
+        } catch {
+          case e: Exception =>
+            throw new RuntimeException(s"Unable to open a UDP socket on port $port", e)
+        }
       }
     }(socket => Sync[F].delay(socket.close()))
   }
@@ -302,6 +307,72 @@ object UdpClient {
             .flatMap(bytes => Sync[F].delay(println(s"Our bytes were: $bytes")))
 //          writeOutDummyPacket.*>(receivePackets)
           receivePackets
+      }
+  }
+
+  val readBuffer = Array.fill[Byte](20000)(0)
+
+  // WARNING: Cannot use the datagram packet between next calls!
+  def unsafeBlockingPacketIterator(socket: DatagramSocket): Iterator[DatagramPacket] = {
+    val packet = new DatagramPacket(readBuffer, readBuffer.length)
+    new Iterator[DatagramPacket] {
+      override def hasNext: Boolean = true
+
+      override def next(): DatagramPacket = {
+        socket.receive(packet)
+        packet
+      }
+    }
+  }
+
+  def tapIterator[A](iterator: Iterator[A])(f: A => Unit): Iterator[A] = {
+    iterator.map{x =>
+      f(x)
+      x
+    }
+  }
+
+  def unsafeDownloadFile(socket: DatagramSocket): Unit = {
+    val dataDecoder = OpenRQ.newDecoder(UdpCommon.defaultFECParameters, 5)
+    val serverAddress = new InetSocketAddress(InetAddress.getByName("localhost"), 8012)
+    val packet = FileRequest.createFileRequest(serverAddress, new UUID(0, 0)).underlyingPacket
+    val fileRequestDatagramPacket = UdpCommon.datagramPacketFromFS2Packet(packet)
+    val downloadIterator = unsafeBlockingPacketIterator(socket)
+      .|>(tapIterator(_)(_ => println("A")))
+      .map(UdpCommon.fs2packetFromDatagramPacket)
+      .|>(tapIterator(_)(_ => println("B")))
+      .map(FileResponsePacket.decode(_, dataDecoder))
+      .|>(tapIterator(_)(_ => println("C")))
+      .collect{case Some(fileFragment: FileFragment) => fileFragment}
+      .|>(tapIterator(_)(_ => println("D")))
+      .map(_.toEncodingPacketWithDecoder(dataDecoder))
+      .|>(tapIterator(_)(_ => println("E")))
+      .map(BatchRaptorQDecoder.feedSinglePacket(_, UdpCommon.defaultFECParameters, dataDecoder))
+      .|>(tapIterator(_)(_ => println("F")))
+      .takeWhile(finishedDecoding => !finishedDecoding)
+      .|>(tapIterator(_)(_ => println("G")))
+
+    socket.send(fileRequestDatagramPacket)
+    println("Sent file request")
+    var i = 0
+    downloadIterator.foreach{_ =>
+      println(s"Processed packet: $i")
+      i += 1
+    }
+    val stopRequest = StopRequest.createStopRequest(serverAddress, new UUID(0, 0)).underlyingPacket
+    socket.send(UdpCommon.datagramPacketFromFS2Packet(stopRequest))
+  }
+
+  def downloadFileAA[F[_] : Sync : ContextShift](blocker: Blocker, socket: DatagramSocket): F[Unit] = {
+    blocker.blockOn(Sync[F].delay(unsafeDownloadFile(socket)))
+  }
+
+  def downloadFileA[F[_] : Sync : ContextShift](fileUUID: UUID): F[Unit] = {
+    GlobalResources.blockerResource[F]
+      .flatMap(blocker => GlobalResources.makeDatagramSocket(8011).map((_, blocker)))
+//      .flatMap(blocker => DummySocket.asResource[F](8011).map((_, blocker)))
+      .use{
+        case (socket, blocker) => downloadFileAA(blocker, socket)
       }
   }
 
@@ -342,7 +413,7 @@ sealed trait RequestCode {
   def asByte: Byte
 }
 case object FileRequestCode extends RequestCode {
-  override def asByte: Byte = 0
+  override def asByte: Byte = 27
 }
 case object StopRequestCode extends RequestCode {
   override def asByte: Byte = 1
@@ -380,6 +451,8 @@ final case class FileRequest(underlyingPacket: Packet) extends ClientRequest {
 
   def getFileUUID: UUID = {
     val byteBuffer = java.nio.ByteBuffer.wrap(rawBytesOfPacket)
+    // Discard one byte, which just signals the byte here
+    byteBuffer.get()
     val mostSignificantBits = byteBuffer.getLong()
     val leastSignificantBits = byteBuffer.getLong()
     new UUID(mostSignificantBits, leastSignificantBits)
@@ -488,13 +561,26 @@ object FileFragment {
 final case class FileUUIDNotFound(underlyingPacket: Packet) extends FileResponsePacket
 object FileUUIDNotFound {
   def encode(inetSocketAddress: InetSocketAddress, uuid: UUID): FileUUIDNotFound = {
-    val lengthOfArray = 1 + 4 // One byte for the initial response and then 4 for the UUID
-    val rawBytes = Array.fill[Byte](lengthOfArray)(0)
-    rawBytes(0) = FileUUIDNotFoundStatus.asByte
-    val byteBuffer = ByteBuffer.wrap(rawBytes, 1, 4)
-    byteBuffer.putLong(uuid.getMostSignificantBits)
-    byteBuffer.putLong(uuid.getLeastSignificantBits)
-    FileUUIDNotFound(Packet(inetSocketAddress, Chunk.bytes(byteBuffer.array())))
+    try {
+      println("ENCODEA")
+      val lengthOfArray = 1 + 16 // One byte for the initial response and then 4 for the UUID
+      println("ENCODEB")
+      val rawBytes = Array.fill[Byte](lengthOfArray)(0)
+      println("ENCODEC")
+      rawBytes(0) = FileUUIDNotFoundStatus.asByte
+      println("ENCODED")
+      val byteBuffer = ByteBuffer.wrap(rawBytes, 1, 16)
+      println("ENCODEE")
+      byteBuffer.putLong(uuid.getMostSignificantBits)
+      println("ENCODEF")
+      byteBuffer.putLong(uuid.getLeastSignificantBits)
+      println("ENCODEG")
+      FileUUIDNotFound(Packet(inetSocketAddress, Chunk.bytes(byteBuffer.array())))
+    } catch {
+      case exception: Exception =>
+        println(exception)
+        throw exception
+    }
   }
 }
 
@@ -533,6 +619,22 @@ object UdpCommon {
     val preGet = atomicReference.getAndUpdate(updateF.asJavaUnaryOperator)
     f(preGet).toRight(preGet)
   }
+
+  def fs2packetFromDatagramPacket(packet: DatagramPacket): Packet = {
+    val inetSocketAddress: InetSocketAddress = packet
+      .getSocketAddress
+      // The Java implementation returns an InetSocketAddress it just upcasts to SocketAddress
+      .asInstanceOf[InetSocketAddress]
+    val chunk = Chunk.bytes(packet.getData, packet.getOffset, packet.getLength)
+    Packet(inetSocketAddress, chunk)
+  }
+
+  def datagramPacketFromFS2Packet(fs2Packet: Packet): DatagramPacket = {
+    val byteBuffer = fs2Packet.bytes.toByteBuffer
+    val datagramPacket = new DatagramPacket(byteBuffer.array(), byteBuffer.arrayOffset(), fs2Packet.bytes.size)
+    datagramPacket.setSocketAddress(fs2Packet.remote)
+    datagramPacket
+  }
 }
 
 sealed abstract case class UniqueQueue[A](toQueue: Queue[A], private val uniquenessSet: Set[A]) {
@@ -565,6 +667,9 @@ final case class ServerState(
   currentRequestsBeingProcessed: Set[FileRequest],
   filesWaitingTransfer: UniqueQueue[FileRequest]
 ) {
+  def abbreviatedToString: String =
+    s"ServerState(currentRequestsBeingProcessed: ${currentRequestsBeingProcessed.size} elements, filesWaitingTransfer: ${filesWaitingTransfer.size} elements)"
+
   def markBeingProcessed: Option[(FileRequest, ServerState)] = {
     filesWaitingTransfer.dequeueOption.map{
       case (requestToProcess, newQueue) =>
@@ -635,29 +740,41 @@ object UdpServer {
     new AtomicReference[ServerState](ServerState(Set.empty, UniqueQueue.empty[FileRequest]))
 
   def transferFile(request: FileRequest): Iterator[FileResponsePacket] = {
+    println(s"REQUEST: ${request.getFileUUID}")
+    println("HELLOA")
     val requestAddress = request.underlyingPacket.remote
-    UdpCommon.uuidToFileName.get(request.getFileUUID) match {
+    println("HELLOB")
+    val result = UdpCommon.uuidToFileName.get(request.getFileUUID) match {
       case None =>
+        println("HELLOC")
         Iterator.single(FileUUIDNotFound.encode(requestAddress, request.getFileUUID))
       case Some(path) =>
+        println("HELLOD")
         val bytes = ArraySeqUtils.unsafeReadFromPath(path)
+        println("HELLOE")
         val encodingPackets = RaptorQEncoder.encodeAsSingleBlockIterator(bytes, 10000)._2
+        println("HELLOF")
         encodingPackets.map(FileFragment.encode(requestAddress, _))
     }
+    println("HELLOG")
+    result
   }
 
   def unsafeProcessResponsePacket(fileResponsePacket: FileResponsePacket, datagramSocket: DatagramSocket): Unit = {
+    println("Beginning processing")
     val packet = FileResponsePacket.encode(fileResponsePacket)
-    val byteBuffer = packet.bytes.toByteBuffer
-    val datagramPacket = new DatagramPacket(byteBuffer.array(), byteBuffer.arrayOffset(), packet.bytes.size)
-    datagramPacket.setSocketAddress(packet.remote)
+    val datagramPacket = UdpCommon.datagramPacketFromFS2Packet(packet)
+    println("About to send to socket...")
     datagramSocket.send(datagramPacket)
   }
 
   def unsafeProcessOneElementOfServerState(serverState: AtomicReference[ServerState], datagramSocket: DatagramSocket): Unit = {
+    println("Receive request to process one element")
     UdpCommon.updateAndGetMoreInfo(serverState)(_.markBeingProcessed) match {
       case Right((fileRequest, _)) =>
+        println("Updated state successfully")
         val iterator = transferFile(fileRequest)
+        println("Created iterator!")
         var i = 0
         Breaks.breakable{
           iterator.foreach{packet =>
@@ -667,11 +784,14 @@ object UdpServer {
               if (!stillShouldProcess) {
                 Breaks.break()
               }
+              println(s"WE'VE processed: $i")
             }
             i += 1
           }
         }
-      case Left(_) => ()
+      case Left(x) =>
+        println(s"No outstanding requests so not doing anything...: $x")
+        ()
     }
   }
 
@@ -683,21 +803,16 @@ object UdpServer {
   def unsafeBlockingListenToSocketOnce(socket: DatagramSocket): ClientRequest = {
     val packetReadBuffer: Array[Byte] = Array.fill[Byte](20000)(0)
     val packet = new DatagramPacket(packetReadBuffer, packetReadBuffer.length)
-    socket.receive(packet);
-    println(s"Received a packet!: $packet")
-    val inetSocketAddress: InetSocketAddress = packet
-      .getSocketAddress
-      // The Java implementation returns an InetSocketAddress it just upcasts to SocketAddress
-      .asInstanceOf[InetSocketAddress]
-    val chunk = Chunk.bytes(packet.getData, packet.getOffset, packet.getLength)
-    val fs2Packet = Packet(inetSocketAddress, chunk)
+    socket.receive(packet)
+    val fs2Packet = UdpCommon.fs2packetFromDatagramPacket(packet)
     // FIXME
-    ClientRequest.decodeFromPacket(fs2Packet).get
+    ClientRequest.decodeFromPacket(fs2Packet).getOrElse(throw new Exception(s"BLAH: $fs2Packet"))
   }
 
   def unsafeDealWithRequest(serverState: AtomicReference[ServerState], clientRequest: ClientRequest): Unit = {
+    println(s"Received this client request: $clientRequest")
     serverState.getAndUpdate(_.markClientRequestReceived(clientRequest))
-    println(s"Updated server state! ${serverState.get()}")
+    println(s"Updated server state! ${serverState.get().abbreviatedToString}")
   }
 
   def unsafeBlockingDealWithSocketOnce(socket: DatagramSocket, serverState: AtomicReference[ServerState]): Unit = {
@@ -775,12 +890,10 @@ object UdpServer {
 
   def fullRun[F[_] : Concurrent: ContextShift]: F[Unit] = {
     GlobalResources.blockerResource[F]
-      .flatMap(blocker => GlobalResources.makeDatagramSocket[F](8012).map((blocker, _)))
+      .flatMap(blocker => GlobalResources.makeDatagramSocket[F](8012).map(socket => (blocker, socket)))
+//      .flatMap(blocker => DummySocket.asResource[F](8012).map(socket => (blocker, socket)))
       .use{
         case (blocker, socket) =>
-          val processingStateStream = fs2.Stream
-            .constant[F, fs2.Stream[F, Unit]](fs2.Stream.eval(processOneElementOfServerState[F](UdpServer.serverState, socket)), 1)
-            .parJoin(5)
           val listeningToSocketStream = fs2.Stream.repeatEval(dealWithSocketOnce(blocker, socket, UdpServer.serverState))
           listeningToSocketStream
             .evalMap(_ => Concurrent[F].start(processOneElementOfServerState[F](UdpServer.serverState, socket)))
@@ -800,6 +913,68 @@ object UdpServer {
   }
 }
 
+class DummySocket(val port: Int) extends DatagramSocket {
+
+  private def copyDatagramPacket(packet: DatagramPacket): DatagramPacket = {
+    val newBackingArray = Array.fill[Byte](packet.getLength)(0)
+    Array.copy(packet.getData, packet.getOffset, newBackingArray, 0, packet.getLength)
+    val newPacket = new DatagramPacket(newBackingArray, 0, newBackingArray.length)
+    newPacket.setSocketAddress(packet.getSocketAddress)
+    newPacket
+  }
+
+  override def send(p: DatagramPacket): Unit = {
+    println("Sending packet...")
+    if (p.getSocketAddress.asInstanceOf[InetSocketAddress].getPort == 8011) {
+      DummySocket.listOfPackets0.put(copyDatagramPacket(p))
+    } else if (p.getSocketAddress.asInstanceOf[InetSocketAddress].getPort == 8012) {
+      DummySocket.listOfPackets1.put(copyDatagramPacket(p))
+    } else {
+      ???
+    }
+  }
+
+  override def receive(p: DatagramPacket): Unit = {
+    val packet = if (port == 8011) {
+      DummySocket.listOfPackets0.take()
+    } else if (port == 8012) {
+      DummySocket.listOfPackets1.take()
+    } else {
+      ???
+    }
+    println("Receiving packet...")
+    p.setSocketAddress(packet.getSocketAddress)
+    val backingArrayOfRecipient = p.getData
+    p.setLength(packet.getLength)
+    var i = 0
+    val backingPacketArray = packet.getData
+    while (i < packet.getLength) {
+      val currentWriteIndex = p.getOffset + i
+      backingArrayOfRecipient(currentWriteIndex) = backingPacketArray(i)
+      i += 1
+    }
+  }
+
+  override def close(): Unit = {
+    super.close()
+    if (port == 8011) {
+      DummySocket.listOfPackets0.clear()
+    } else if (port == 8012) {
+      DummySocket.listOfPackets1.clear()
+    }
+  }
+
+}
+
+object DummySocket {
+
+  val listOfPackets0: LinkedBlockingQueue[DatagramPacket] = new LinkedBlockingQueue[DatagramPacket]()
+  val listOfPackets1: LinkedBlockingQueue[DatagramPacket] = new LinkedBlockingQueue[DatagramPacket]()
+
+  def asResource[F[_] : Applicative](port: Int): Resource[F, DatagramSocket] =
+    Resource.make(Applicative[F].pure[DatagramSocket](new DummySocket(port)))(_ => Applicative[F].pure(()))
+}
+
 object Main extends IOApp {
 
   override def run(args: List[String]): IO[ExitCode] = {
@@ -810,9 +985,17 @@ object Main extends IOApp {
     println(s"Hello world!: $result")
 
     val action = if (args(1) == "client") {
-      UdpClient.downloadFile[IO](new UUID(0, 0))
+      UdpClient.downloadFileA[IO](new UUID(0, 0))
     } else if (args(1) == "server") {
       UdpServer.fullRun[IO]
+    } else if (args(1) == "combined") {
+      for {
+        serverFiber <- UdpServer.fullRun[IO].start
+        _ <- IO.sleep(FiniteDuration(1, TimeUnit.SECONDS))
+        clientFiber <- UdpClient.downloadFileA[IO](new UUID(0, 0)).start
+        _ <- serverFiber.join
+        _ <- clientFiber.join
+      } yield ()
     } else {
       IO{
         Thread.sleep(20000)
