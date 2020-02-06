@@ -60,10 +60,10 @@ class TestRaptorCode extends AnyFlatSpec with Matchers {
       fileDownloaded <- clientFiber.join
     } yield fileDownloaded
 
-    combinedAction.unsafeRunSync().length should be (36510210)
+    combinedAction.unsafeRunSync().length should be (UdpCommon.uuidToFileName(UdpCommon.fileInQuestion)._2)
   }
-  it should "work with uploads" in {
-    val fileNameOnDisk = "Track 10.wav"
+  ignore should "work with uploads" in {
+    val fileNameOnDisk = UdpCommon.uuidToFileName(UdpCommon.fileInQuestion)._1
     // FIXME
     val fileName = BoundedString.fromString("random file").get
     val serverAction = GlobalResources.blockerResource[IO]
@@ -84,7 +84,7 @@ class TestRaptorCode extends AnyFlatSpec with Matchers {
       .use{
         case (socket, blocker) =>
           for {
-            fileBytes <- ArraySeqUtils.readFromFile[IO](fileNameOnDisk)
+            fileBytes <- ArraySeqUtils.readFromPath[IO](fileNameOnDisk)
             _ <- UdpClient.uploadFile[IO](blocker, socket, fileBytes, new InetSocketAddress(8012), new UUID(1L, 1L), fileName)
           } yield ()
       }
